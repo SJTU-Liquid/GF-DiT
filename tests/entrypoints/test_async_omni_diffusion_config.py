@@ -87,3 +87,38 @@ def test_default_stage_devices_from_sequence_parallel(monkeypatch):
     else:
         devices = getattr(runtime, "devices", None)
     assert devices == "0,1,2,3"
+
+
+def test_default_stage_config_includes_runtime_v2(monkeypatch):
+    """Ensure runtime_v2 knobs are preserved in default diffusion stage."""
+    monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
+    monkeypatch.setattr(utils_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
+    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+    monkeypatch.setattr(AsyncOmni, "_init_inline_diffusion_engine", _noop_inline_engine)
+
+    omni = AsyncOmni(
+        model=MODEL,
+        enable_runtime_v2=True,
+        runtime_v2_denoise_chunk_size=3,
+        runtime_v2_scheduler_policy="srtf",
+        runtime_v2_collective_backend="gfc",
+        runtime_v2_group_sizes="4,2,1,1",
+        runtime_v2_groups_json=(
+            '[{"size":4,"tp":4,"ulysses_degree":1,"ring_degree":1},'
+            '{"size":2,"tp":2,"ulysses_degree":1,"ring_degree":1},'
+            '{"size":1,"tp":1,"ulysses_degree":1,"ring_degree":1},'
+            '{"size":1,"tp":1,"ulysses_degree":1,"ring_degree":1}]'
+        ),
+        runtime_v2_dit_step_schedule='[{"start":0,"end":2,"group_id":"g0"}]',
+    )
+
+    stage_cfg = omni.stage_configs[0]
+    engine_args = stage_cfg.engine_args
+    assert engine_args.get("enable_runtime_v2") is True
+    assert engine_args.get("runtime_v2_denoise_chunk_size") == 3
+    assert engine_args.get("runtime_v2_scheduler_policy") == "srtf"
+    assert engine_args.get("runtime_v2_collective_backend") == "gfc"
+    assert engine_args.get("runtime_v2_group_sizes") == "4,2,1,1"
+    assert isinstance(engine_args.get("runtime_v2_groups_json"), str)
+    assert isinstance(engine_args.get("runtime_v2_dit_step_schedule"), str)

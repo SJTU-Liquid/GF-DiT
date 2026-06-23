@@ -68,19 +68,33 @@ class TorchProfiler(ProfilerBase):
             except Exception as e:
                 logger.warning(f"[Rank {rank}] Failed to export trace: {e}")
 
-        # 4. Initialize profiler with long active period
+        # 4. Initialize profiler.
+        #
+        # Knobs are env-overridable to keep trace size manageable. Defaults
+        # match the historical behavior (long capture, deep info) but real
+        # production / diagnosis runs almost always need them turned down,
+        # otherwise export_chrome_trace serializes multi-GB JSON synchronously
+        # and the worker appears to hang.
+        _active = int(os.environ.get("VLLM_TORCH_PROFILER_ACTIVE", "100000"))
+        _wait = int(os.environ.get("VLLM_TORCH_PROFILER_WAIT", "0"))
+        _warmup = int(os.environ.get("VLLM_TORCH_PROFILER_WARMUP", "0"))
+        _record_shapes = os.environ.get("VLLM_TORCH_PROFILER_RECORD_SHAPES", "1") == "1"
+        _profile_memory = os.environ.get("VLLM_TORCH_PROFILER_PROFILE_MEMORY", "1") == "1"
+        _with_stack = os.environ.get("VLLM_TORCH_PROFILER_WITH_STACK", "1") == "1"
+        _with_flops = os.environ.get("VLLM_TORCH_PROFILER_WITH_FLOPS", "1") == "1"
+
         cls._profiler = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             schedule=torch.profiler.schedule(
-                wait=0,
-                warmup=0,
-                active=100000,  # long capture window
+                wait=_wait,
+                warmup=_warmup,
+                active=_active,
             ),
             on_trace_ready=trace_handler,
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
-            with_flops=True,
+            record_shapes=_record_shapes,
+            profile_memory=_profile_memory,
+            with_stack=_with_stack,
+            with_flops=_with_flops,
         )
 
         # 5. Start profiling

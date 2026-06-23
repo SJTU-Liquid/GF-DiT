@@ -359,6 +359,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
+        output_type = req.sampling_params.output_type or output_type
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)

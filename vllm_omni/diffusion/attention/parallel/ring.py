@@ -17,6 +17,7 @@ from vllm_omni.diffusion.attention.parallel.base import (
     # ParallelAttentionStrategy, # Not used in type hint below currently
 )
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 
 # from vllm_omni.diffusion.attention.backends.ring_selector import AttnType # Already imported above
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -48,8 +49,17 @@ class RingParallelAttention:
         sp_group: SequenceParallelGroupCoordinator,
         attn_backend_pref: str | None = None,
     ) -> None:
-        self._sp_group = sp_group
+        # See UlyssesParallelAttention.__init__ for the rationale. The active
+        # SP group can be swapped at runtime by runtime_v2's
+        # _maybe_activate_group_session; capturing sp_group here would freeze
+        # a stale reference to the construction-time group. Read fresh via
+        # get_sp_group() on every access.
+        del sp_group
         self.attn_backend_pref = attn_backend_pref
+
+    @property
+    def _sp_group(self) -> SequenceParallelGroupCoordinator:
+        return get_sp_group()
 
     @property
     def enabled(self) -> bool:

@@ -5,6 +5,7 @@ import copy
 import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
 from vllm.config import VllmConfig
@@ -42,9 +43,27 @@ logger = init_logger(__name__)
 
 
 def _weak_close_cleanup_async(
-    stage_list, stage_in_queues, stage_out_queues, ray_pg, output_handler, zmq_ctx=None, inline_engine=None
+    stage_list,
+    stage_in_queues,
+    stage_out_queues,
+    ray_pg,
+    output_handler,
+    zmq_ctx=None,
+    inline_engine=None,
+    inline_control_executor=None,
+    inline_collect_executor=None,
 ):
     """Weak reference cleanup function for AsyncOmni instances."""
+    if inline_control_executor is not None:
+        try:
+            inline_control_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:
+            logger.warning("Failed to shutdown inline control executor: %s", e)
+    if inline_collect_executor is not None:
+        try:
+            inline_collect_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:
+            logger.warning("Failed to shutdown inline collect executor: %s", e)
     if inline_engine is not None:
         try:
             inline_engine.close()
@@ -130,6 +149,14 @@ class AsyncOmni(OmniBase):
         self._companion_to_parent: dict[str, str] = {}
 
         super().__init__(model, **kwargs)
+        self._inline_control_executor: ThreadPoolExecutor | None = None
+        self._inline_collect_executor: ThreadPoolExecutor | None = None
+        if self._inline_diffusion:
+            # Serialize submit/collect operations for inline diffusion engine.
+            # OmniDiffusion itself is sync and not designed for concurrent
+            # cross-thread submit/collect calls.
+            self._inline_control_executor = ThreadPoolExecutor(max_workers=1)
+            self._inline_collect_executor = ThreadPoolExecutor(max_workers=1)
 
         # Register weak reference cleanup (called on garbage collection)
         self._weak_finalizer = weakref.finalize(
@@ -142,6 +169,8 @@ class AsyncOmni(OmniBase):
             self.output_handler,
             self._zmq_ctx,
             getattr(self, "_inline_engine", None),
+            self._inline_control_executor,
+            self._inline_collect_executor,
         )
 
     async def get_supported_tasks(self) -> set[str]:
@@ -159,13 +188,9 @@ class AsyncOmni(OmniBase):
         cache_backend = kwargs.get("cache_backend", "none")
         cache_config = self._normalize_cache_config(cache_backend, kwargs.get("cache_config", None))
 
-        devices = "0"
-        if "parallel_config" in kwargs:
-            parallel_config = kwargs["parallel_config"]
-            num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
-        else:
+        # Resolve baseline parallel config and inferred world size.
+        parallel_config = kwargs.get("parallel_config", None)
+        if parallel_config is None:
             ulysses_degree = kwargs.get("ulysses_degree") or 1
             ring_degree = kwargs.get("ring_degree") or 1
             sequence_parallel_size = kwargs.get("sequence_parallel_size")
@@ -187,8 +212,6 @@ class AsyncOmni(OmniBase):
             else:
                 num_devices = other_parallel_size
 
-            for i in range(1, num_devices):
-                devices += f",{i}"
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
@@ -203,6 +226,17 @@ class AsyncOmni(OmniBase):
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
             )
+        else:
+            num_devices = int(parallel_config.world_size)
+
+        # Resolve stage-visible device count for default diffusion stage.
+        # Explicit --num-gpus has highest priority.
+        raw_num_gpus = kwargs.get("num_gpus", None)
+        if raw_num_gpus is not None:
+            num_devices = int(raw_num_gpus)
+        if num_devices < 1:
+            raise ValueError(f"num_gpus/world_size must be >= 1, got {num_devices}")
+        devices = ",".join(str(i) for i in range(num_devices))
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -217,6 +251,28 @@ class AsyncOmni(OmniBase):
                     "model_class_name": kwargs.get("model_class_name", None),
                     "vae_use_slicing": kwargs.get("vae_use_slicing", False),
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
+                    "enable_runtime_v2": kwargs.get("enable_runtime_v2", False),
+                    "runtime_v2_denoise_chunk_size": kwargs.get("runtime_v2_denoise_chunk_size", 1),
+                    "runtime_v2_scheduler_policy": kwargs.get("runtime_v2_scheduler_policy", "fcfs"),
+                    "runtime_v2_collective_backend": kwargs.get("runtime_v2_collective_backend", "torch"),
+                    "runtime_v2_gfc_max_collective_mb": kwargs.get("runtime_v2_gfc_max_collective_mb", 128),
+                    "runtime_v2_group_sizes": kwargs.get("runtime_v2_group_sizes", None),
+                    "runtime_v2_groups_json": kwargs.get("runtime_v2_groups_json", None),
+                    "runtime_v2_dit_step_schedule": kwargs.get("runtime_v2_dit_step_schedule", None),
+                    "runtime_v2_edf_greedy_sp_sizes": kwargs.get("runtime_v2_edf_greedy_sp_sizes", None),
+                    "runtime_v2_cost_model_dir": kwargs.get("runtime_v2_cost_model_dir", None),
+                    "runtime_v2_disaggregate_aux_group_id": kwargs.get(
+                        "runtime_v2_disaggregate_aux_group_id", None
+                    ),
+                    "runtime_v2_disaggregate_dit_group_id": kwargs.get(
+                        "runtime_v2_disaggregate_dit_group_id", None
+                    ),
+                    "runtime_v2_wave_stress_warmup_reqs": kwargs.get(
+                        "runtime_v2_wave_stress_warmup_reqs", 5
+                    ),
+                    "runtime_v2_wave_stress_wave_size": kwargs.get(
+                        "runtime_v2_wave_stress_wave_size", 4
+                    ),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
@@ -517,12 +573,18 @@ class AsyncOmni(OmniBase):
 
         try:
             loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(
-                None,
-                self._inline_engine.generate,
+            submission_id = await loop.run_in_executor(
+                self._inline_control_executor,
+                self._inline_engine.submit,
                 prompt,
                 sp0,
                 [request_id],
+            )
+            results = await loop.run_in_executor(
+                self._inline_collect_executor,
+                self._inline_engine.collect,
+                submission_id,
+                None,
             )
 
             for result in results:

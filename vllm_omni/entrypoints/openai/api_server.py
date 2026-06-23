@@ -1211,6 +1211,11 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
 
+        # Pass-through runtime_v2 scheduling metadata (priority/deadline/arrival/
+        # request_class) so EDF/best-fit policies can see it on the image path.
+        if request.extra_args:
+            gen_params.extra_args.update(request.extra_args)
+
         request_id = f"img_gen_{uuid.uuid4().hex}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
@@ -1803,7 +1808,15 @@ async def _run_video_generation_job(
         )
     except asyncio.CancelledError:
         _cleanup_video(video_id, output_path)
-        await VIDEO_STORE.pop(video_id)
+        await VIDEO_STORE.update_fields(
+            video_id,
+            {
+                "status": VideoGenerationStatus.FAILED,
+                "completed_at": int(time.time()),
+                "error": VideoError(code="CancelledError", message="Video generation task was cancelled."),
+                "inference_time_s": time.perf_counter() - started_at,
+            },
+        )
         raise
 
 
@@ -1838,6 +1851,7 @@ async def create_video(
     seed: int | None = Form(default=None),
     negative_prompt: str | None = Form(default=None),
     lora: str | None = Form(default=None),
+    extra_args: str | None = Form(default=None),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
 
@@ -1868,6 +1882,8 @@ async def create_video(
         seed: Optional random seed override.
         negative_prompt: Optional negative prompt.
         lora: Optional JSON-encoded per-request LoRA configuration.
+        extra_args: Optional JSON-encoded passthrough metadata, e.g. the
+            runtime_v2 EDF scheduling fields (priority/deadline/arrival).
 
     Returns:
         A queued ``VideoResponse`` that includes the generated job identifier
@@ -1905,6 +1921,10 @@ async def create_video(
         "seed": seed,
         "negative_prompt": negative_prompt,
         "lora": _parse_form_json(lora),
+        # JSON-encoded passthrough; VideoGenerationRequest's field validator
+        # parses the string. Carries the runtime_v2 EDF scheduling metadata
+        # (priority / deadline_ms / arrival_ms / request_class).
+        "extra_args": extra_args,
     }
 
     request_data = {k: v for k, v in request_data.items() if v is not None}
@@ -1944,6 +1964,14 @@ async def create_video(
 
     reference_image = ReferenceImage(data=image_data) if image_data is not None else image_data
     await VIDEO_STORE.upsert(ref.id, ref)
+    logger.info(
+        "Queued video job id=%s status=%s user=%s model=%s prompt_len=%d",
+        ref.id,
+        ref.status,
+        request.user,
+        request.model or effective_model_name,
+        len(request.prompt),
+    )
     task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, reference_image))
     await VIDEO_TASKS.upsert(ref.id, task)
     return ref
@@ -2001,6 +2029,14 @@ async def retrieve_video(video_id: str) -> VideoResponse:
     """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
+        jobs = await VIDEO_STORE.list_values()
+        sample_ids = [item.id for item in jobs[:5]]
+        logger.warning(
+            "Video lookup miss id=%s (store_size=%d sample_ids=%s)",
+            video_id,
+            len(jobs),
+            sample_ids,
+        )
         raise HTTPException(status_code=404, detail="Video not found")
     return job
 
@@ -2074,15 +2110,42 @@ async def download_video(video_id: str) -> FileResponse:
     """
     job = await VIDEO_STORE.get(video_id)
     if job is None:
+        jobs = await VIDEO_STORE.list_values()
+        sample_ids = [item.id for item in jobs[:5]]
+        logger.warning(
+            "Video content lookup miss id=%s (store_size=%d sample_ids=%s)",
+            video_id,
+            len(jobs),
+            sample_ids,
+        )
         raise HTTPException(status_code=404, detail="Video not found")
 
     if job.status == VideoGenerationStatus.FAILED:
+        logger.warning(
+            "Video content request rejected for failed job id=%s status=%s error=%s",
+            video_id,
+            job.status,
+            job.error,
+        )
         raise HTTPException(status_code=422, detail="Video generation failed. Check job status for error details.")
     if not job.file_name:
+        logger.warning(
+            "Video content not ready id=%s status=%s file_name=%s",
+            video_id,
+            job.status,
+            job.file_name,
+        )
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
 
     full_path = STORAGE_MANAGER.get_full_file_path(job.file_name)
     if not os.path.exists(full_path):
+        logger.warning(
+            "Video content file missing on disk id=%s file_name=%s path=%s status=%s",
+            video_id,
+            job.file_name,
+            full_path,
+            job.status,
+        )
         raise HTTPException(status_code=404, detail="Generated video file not found on disk")
 
     return FileResponse(path=full_path, media_type=job.media_type, filename=job.file_name)

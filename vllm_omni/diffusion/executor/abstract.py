@@ -63,6 +63,14 @@ class DiffusionExecutor(ABC):
         """Add requests to the execution queue."""
         pass
 
+    def submit_req(self, request: OmniDiffusionRequest) -> str:
+        """Submit a request without blocking for completion."""
+        raise NotImplementedError("submit_req is not implemented for this executor backend")
+
+    def collect_req(self, request_id: str, timeout_s: float | None = None) -> DiffusionOutput:
+        """Collect a previously submitted request."""
+        raise NotImplementedError("collect_req is not implemented for this executor backend")
+
     @abstractmethod
     def collective_rpc(
         self,

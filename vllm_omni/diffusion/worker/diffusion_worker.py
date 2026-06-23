@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -31,8 +32,10 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
+    initialize_model_parallel_from_execution_groups,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.distributed.collective_runtime import init_runtime_v2_collective_runtime
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
@@ -44,6 +47,12 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _PendingRuntimeV2Submission:
+    scheduler_req_id: str
+    should_reply: bool
 
 
 class DiffusionWorker:
@@ -64,14 +73,26 @@ class DiffusionWorker:
         local_rank: int,
         rank: int,
         od_config: OmniDiffusionConfig,
+        *,
+        device_id: int | None = None,
+        world_size: int | None = None,
+        master_addr: str | None = None,
+        master_port: int | None = None,
         skip_load_model: bool = False,
     ):
         self.local_rank = local_rank
         self.rank = rank
         self.od_config = od_config
+        self.device_id = int(rank if device_id is None else device_id)
+        resolved_world_size = world_size if world_size is not None else getattr(self.od_config, "num_gpus", 1)
+        self.distributed_world_size = int(resolved_world_size or 1)
+        self.distributed_master_addr = str(master_addr or "localhost")
+        resolved_master_port = self.od_config.master_port if master_port is None else master_port
+        self.distributed_master_port = int(resolved_master_port or 30005)
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionModelRunner | None = None
+        self.runtime_v2_runner = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.init_device()
@@ -88,18 +109,18 @@ class DiffusionWorker:
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
-        world_size = self.od_config.num_gpus
+        world_size = self.distributed_world_size
         rank = self.rank
 
         # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        os.environ["MASTER_ADDR"] = self.distributed_master_addr
+        os.environ["MASTER_PORT"] = str(self.distributed_master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
         # Setup device
-        self.device = current_omni_platform.get_torch_device(rank)
+        self.device = current_omni_platform.get_torch_device(self.device_id)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration
@@ -118,22 +139,46 @@ class DiffusionWorker:
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
             parallel_config = self.od_config.parallel_config
-            initialize_model_parallel(
-                data_parallel_size=parallel_config.data_parallel_size,
-                cfg_parallel_size=parallel_config.cfg_parallel_size,
-                sequence_parallel_size=parallel_config.sequence_parallel_size,
-                ulysses_degree=parallel_config.ulysses_degree,
-                ring_degree=parallel_config.ring_degree,
-                tensor_parallel_size=parallel_config.tensor_parallel_size,
-                pipeline_parallel_size=parallel_config.pipeline_parallel_size,
-                fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
-                hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
-                enable_expert_parallel=parallel_config.enable_expert_parallel,
+            init_runtime_v2_collective_runtime(
+                backend=getattr(self.od_config, "runtime_v2_collective_backend", "torch"),
+                device=self.device,
+                max_group_size=min(world_size, 16),
+                max_collective_bytes=int(
+                    getattr(self.od_config, "runtime_v2_gfc_max_collective_mb", 128)
+                )
+                * 1024
+                * 1024,
             )
+            runtime_v2_execution_groups = getattr(self.od_config, "runtime_v2_execution_groups", None)
+            runtime_v2_worker_group_id = getattr(self.od_config, "runtime_v2_worker_group_id", None)
+            if runtime_v2_execution_groups:
+                # runtime_v2 shared-world path:
+                # build TP/SP/CFG/... sub-groups from explicit execution-group
+                # topology while all workers stay in one global world.
+                initialize_model_parallel_from_execution_groups(
+                    execution_groups=runtime_v2_execution_groups,
+                    current_group_id=runtime_v2_worker_group_id,
+                    enable_expert_parallel=parallel_config.enable_expert_parallel,
+                )
+            else:
+                # Legacy path: derive model-parallel groups from scalar config.
+                initialize_model_parallel(
+                    data_parallel_size=parallel_config.data_parallel_size,
+                    cfg_parallel_size=parallel_config.cfg_parallel_size,
+                    sequence_parallel_size=parallel_config.sequence_parallel_size,
+                    ulysses_degree=parallel_config.ulysses_degree,
+                    ring_degree=parallel_config.ring_degree,
+                    tensor_parallel_size=parallel_config.tensor_parallel_size,
+                    pipeline_parallel_size=parallel_config.pipeline_parallel_size,
+                    fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
+                    hsdp_replicate_size=parallel_config.hsdp_replicate_size if parallel_config.use_hsdp else 1,
+                    enable_expert_parallel=parallel_config.enable_expert_parallel,
+                )
             init_workspace_manager(self.device)
 
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
         """Load the diffusion model using DiffusionModelRunner."""
+        self._close_runtime_v2_runner()
         with (
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
@@ -154,6 +199,7 @@ class DiffusionWorker:
         # When load_format is "dummy", pipeline will init with custom pipeline later
         if load_format != "dummy":
             assert self.model_runner.pipeline is not None
+            self._maybe_init_runtime_v2_runner()
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -182,17 +228,60 @@ class DiffusionWorker:
         """Stop profiling and return the result dictionary."""
         return CurrentProfiler.stop()
 
+    def _activate_lora_adapter(self, req: OmniDiffusionRequest) -> None:
+        if self.lora_manager is None:
+            return
+        try:
+            self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
+        except Exception as exc:
+            if req.sampling_params.lora_request is not None:
+                raise
+            logger.warning("LoRA activation skipped: %s", exc)
+
     def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        if self.lora_manager is not None:
-            try:
-                self.lora_manager.set_active_adapter(req.sampling_params.lora_request, req.sampling_params.lora_scale)
-            except Exception as exc:
-                if req.sampling_params.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+        self._activate_lora_adapter(req)
+        if self.runtime_v2_runner is not None:
+            denoise_chunk_size = int(getattr(self.od_config, "runtime_v2_denoise_chunk_size", 1) or 1)
+            request_id = self.runtime_v2_submit(req, denoise_chunk_size=denoise_chunk_size)
+            return self.runtime_v2_wait(request_id)
         return self.model_runner.execute_model(req)
+
+    def runtime_v2_submit(self, req: OmniDiffusionRequest, denoise_chunk_size: int | None = None) -> str:
+        if self.runtime_v2_runner is None:
+            raise RuntimeError("runtime_v2 runner is not enabled on this worker")
+        if len(req.prompts) != 1:
+            raise ValueError("runtime_v2 currently supports single-prompt requests")
+        if denoise_chunk_size is None:
+            denoise_chunk_size = int(getattr(self.od_config, "runtime_v2_denoise_chunk_size", 1) or 1)
+        return self.runtime_v2_runner.submit(req, denoise_chunk_size=denoise_chunk_size)
+
+    def runtime_v2_wait(self, request_id: str, timeout_s: float | None = None) -> DiffusionOutput:
+        if self.runtime_v2_runner is None:
+            raise RuntimeError("runtime_v2 runner is not enabled on this worker")
+        return self.runtime_v2_runner.wait(request_id, timeout_s=timeout_s)
+
+    def runtime_v2_poll_once(self, timeout_s: float = 0.0) -> None:
+        if self.runtime_v2_runner is None:
+            raise RuntimeError("runtime_v2 runner is not enabled on this worker")
+        self.runtime_v2_runner.poll_once(timeout_s=timeout_s)
+
+    def runtime_v2_get_request_status(self, request_id: str) -> tuple[str, Any | None]:
+        if self.runtime_v2_runner is None:
+            raise RuntimeError("runtime_v2 runner is not enabled on this worker")
+        return self.runtime_v2_runner.get_request_status(request_id)
+
+    def runtime_v2_release_request(self, request_id: str) -> None:
+        # Direct call (not a getattr soft-probe): RuntimeV2Runner always defines
+        # release_request, so a missing method should fail loudly rather than
+        # silently no-op and silently reintroduce the unbounded-state leak.
+        if self.runtime_v2_runner is not None:
+            self.runtime_v2_runner.release_request(request_id)
+
+    def runtime_v2_entrypoint_submit(self, req: OmniDiffusionRequest, denoise_chunk_size: int | None = None) -> str:
+        self._activate_lora_adapter(req)
+        return self.runtime_v2_submit(req, denoise_chunk_size=denoise_chunk_size)
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
@@ -296,7 +385,65 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
+        self._close_runtime_v2_runner()
         destroy_distributed_env()
+
+    def _supports_runtime_v2(self) -> bool:
+        from vllm_omni.diffusion.runtime_v2.registry import supports_runtime_v2_model
+
+        return supports_runtime_v2_model(getattr(self.od_config, "model_class_name", None))
+
+    def _maybe_init_runtime_v2_runner(self) -> None:
+        if not bool(getattr(self.od_config, "enable_runtime_v2", False)):
+            return
+        if getattr(self.od_config, "distributed_executor_backend", None) == "mp":
+            logger.info(
+                "Worker %s: skipping local runtime_v2 runner because multiproc executor owns the centralized scheduler.",
+                self.rank,
+            )
+            return
+        if not self._supports_runtime_v2():
+            raise ValueError(
+                "runtime_v2 does not support "
+                f"model_class_name={getattr(self.od_config, 'model_class_name', None)!r}"
+            )
+        if self.model_runner is None or self.model_runner.pipeline is None:
+            return
+        from vllm_omni.diffusion.runtime_v2.runner import RuntimeV2Runner
+
+        denoise_chunk_size = int(getattr(self.od_config, "runtime_v2_denoise_chunk_size", 1) or 1)
+        scheduler_policy = str(getattr(self.od_config, "runtime_v2_scheduler_policy", "fcfs") or "fcfs").lower()
+        self.runtime_v2_runner = RuntimeV2Runner(
+            pipeline=self.model_runner.pipeline,
+            default_step_chunk_size=denoise_chunk_size,
+            scheduler_policy=scheduler_policy,
+            vllm_config=self.vllm_config,
+            omni_diffusion_config=self.od_config,
+        )
+        logger.info(
+            "Worker %s: runtime_v2 enabled (denoise_chunk_size=%s, policy=%s).",
+            self.rank,
+            denoise_chunk_size,
+            scheduler_policy,
+        )
+
+    def _close_runtime_v2_runner(self) -> None:
+        runner = self.runtime_v2_runner
+        if runner is None:
+            return
+        try:
+            runner.close()
+        except Exception as exc:
+            logger.warning("Worker %s: failed to close runtime_v2 runner cleanly: %s", self.rank, exc)
+        finally:
+            self.runtime_v2_runner = None
+
+    def _can_execute_with_runtime_v2(self, req: OmniDiffusionRequest) -> bool:
+        if self.runtime_v2_runner is None:
+            return False
+        if len(req.prompts) != 1:
+            raise ValueError(f"runtime_v2 currently supports single-prompt requests, got {len(req.prompts)} prompts")
+        return True
 
 
 class CustomPipelineWorkerExtension:
@@ -359,6 +506,9 @@ class WorkerProc:
         # Create worker using WorkerWrapperBase for extension support
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
+        self._pending_runtime_v2: dict[str, _PendingRuntimeV2Submission] = {}
+        self._runtime_v2_active_poll_s = 0.01
+        self._runtime_v2_idle_poll_s = 0.05
 
     def _create_worker(
         self,
@@ -376,29 +526,44 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: DiffusionOutput | dict[str, Any]):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
-            try:
-                pack_diffusion_output_shm(output)
-            except Exception as e:
-                logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
-            self.result_mq.enqueue(output)
+            target = output
+            if isinstance(output, DiffusionOutput):
+                try:
+                    pack_diffusion_output_shm(output)
+                except Exception as e:
+                    logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
+            elif isinstance(output, dict):
+                payload = output.get("output")
+                if isinstance(payload, DiffusionOutput):
+                    try:
+                        pack_diffusion_output_shm(payload)
+                    except Exception as e:
+                        logger.warning("SHM pack failed, falling back to raw enqueue: %s", e)
+                target = output
+            self.result_mq.enqueue(target)
 
-    def recv_message(self):
+    def recv_message(self, timeout_s: float | None = None):
         """Receive messages from broadcast queue."""
-        return self.mq.dequeue(indefinite=True)
+        if timeout_s is None:
+            return self.mq.dequeue(indefinite=True)
+        return self.mq.dequeue(timeout=timeout_s)
+
+    def _resolve_rpc_routing(self, rpc_request: dict) -> tuple[bool, bool]:
+        output_rank = rpc_request.get("output_rank")
+        exec_all_ranks = rpc_request.get("exec_all_ranks", False)
+        should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
+        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+        return should_execute, should_reply
 
     def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
         method = rpc_request["method"]
         args = rpc_request.get("args", ())
         kwargs = rpc_request.get("kwargs", {})
-        output_rank = rpc_request.get("output_rank")
-        exec_all_ranks = rpc_request.get("exec_all_ranks", False)
-
-        should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
-        should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
+        should_execute, should_reply = self._resolve_rpc_routing(rpc_request)
 
         if not should_execute:
             return None, False
@@ -411,14 +576,176 @@ class WorkerProc:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
             raise e
 
+    def _try_handle_runtime_v2_generate_rpc(self, rpc_request: dict) -> bool:
+        if rpc_request.get("method") != "generate":
+            return False
+
+        args = rpc_request.get("args", ())
+        if not args or not isinstance(args[0], OmniDiffusionRequest):
+            return False
+        req = args[0]
+        should_execute, should_reply = self._resolve_rpc_routing(rpc_request)
+        if not should_execute:
+            return True
+        try:
+            if not self.worker._can_execute_with_runtime_v2(req):
+                return False
+        except Exception as exc:
+            logger.error("runtime_v2 request validation failed: %s", exc, exc_info=True)
+            if should_reply and self.result_mq is not None:
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "scheduler_req_id": rpc_request.get("scheduler_req_id"),
+                        "output": DiffusionOutput(error=str(exc)),
+                    }
+                )
+            return True
+        if req.sampling_params.lora_request is not None:
+            message = "runtime_v2 entrypoint mode does not support LoRA requests yet"
+            logger.error(message)
+            if should_reply and self.result_mq is not None:
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "scheduler_req_id": rpc_request.get("scheduler_req_id"),
+                        "output": DiffusionOutput(error=message),
+                    }
+                )
+            return True
+
+        try:
+            runtime_request_id = self.worker.runtime_v2_entrypoint_submit(req)
+            scheduler_req_id = str(rpc_request.get("scheduler_req_id") or runtime_request_id)
+            self._pending_runtime_v2[runtime_request_id] = _PendingRuntimeV2Submission(
+                scheduler_req_id=scheduler_req_id,
+                should_reply=bool(should_reply),
+            )
+            logger.info(
+                "runtime_v2 entrypoint submit: scheduler_req_id=%s runtime_request_id=%s pending=%d",
+                scheduler_req_id,
+                runtime_request_id,
+                len(self._pending_runtime_v2),
+            )
+            return True
+        except Exception as exc:
+            logger.error("runtime_v2 entrypoint submit failed: %s", exc, exc_info=True)
+            if should_reply and self.result_mq is not None:
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "scheduler_req_id": rpc_request.get("scheduler_req_id"),
+                        "output": DiffusionOutput(error=str(exc)),
+                    }
+                )
+            return True
+
+    def _poll_runtime_v2_scheduler(self, timeout_s: float) -> None:
+        if self.worker.runtime_v2_runner is None:
+            return
+        try:
+            self.worker.runtime_v2_poll_once(timeout_s=timeout_s)
+        except Exception as exc:
+            logger.error("runtime_v2 entrypoint poll failed: %s", exc, exc_info=True)
+            self._fail_all_pending_runtime_v2(reason=f"runtime_v2 poll failed: {exc}")
+            self._running = False
+
+    def _drain_runtime_v2_completions(self) -> None:
+        if not self._pending_runtime_v2:
+            return
+        for runtime_request_id in list(self._pending_runtime_v2.keys()):
+            pending = self._pending_runtime_v2.get(runtime_request_id)
+            if pending is None:
+                continue
+            try:
+                status, payload = self.worker.runtime_v2_get_request_status(runtime_request_id)
+            except Exception as exc:
+                logger.error(
+                    "runtime_v2 entrypoint get_request_status failed: request_id=%s error=%s",
+                    runtime_request_id,
+                    exc,
+                    exc_info=True,
+                )
+                status, payload = "failed", str(exc)
+
+            if status == "pending":
+                continue
+
+            if status == "failed":
+                output = DiffusionOutput(error=str(payload))
+            elif status == "finished":
+                output = payload if isinstance(payload, DiffusionOutput) else DiffusionOutput(output=payload)
+            else:
+                continue
+
+            if pending.should_reply and self.result_mq is not None:
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "scheduler_req_id": pending.scheduler_req_id,
+                        "output": output,
+                    }
+                )
+            self._release_runtime_v2_request(runtime_request_id)
+            self._pending_runtime_v2.pop(runtime_request_id, None)
+            logger.info(
+                "runtime_v2 entrypoint complete: scheduler_req_id=%s runtime_request_id=%s pending=%d",
+                pending.scheduler_req_id,
+                runtime_request_id,
+                len(self._pending_runtime_v2),
+            )
+
+    def _fail_all_pending_runtime_v2(self, reason: str) -> None:
+        for runtime_request_id, pending in list(self._pending_runtime_v2.items()):
+            logger.warning(
+                "runtime_v2 force-failing pending request: scheduler_req_id=%s runtime_request_id=%s reason=%s",
+                pending.scheduler_req_id,
+                runtime_request_id,
+                reason,
+            )
+            if pending.should_reply and self.result_mq is not None:
+                self.return_result(
+                    {
+                        "type": "generation_result",
+                        "scheduler_req_id": pending.scheduler_req_id,
+                        "output": DiffusionOutput(error=f"{reason}: request_id={runtime_request_id}"),
+                    }
+                )
+            self._release_runtime_v2_request(runtime_request_id)
+            self._pending_runtime_v2.pop(runtime_request_id, None)
+
+    def _release_runtime_v2_request(self, runtime_request_id: str) -> None:
+        try:
+            self.worker.runtime_v2_release_request(runtime_request_id)
+        except Exception as exc:
+            logger.warning(
+                "runtime_v2 request release failed: request_id=%s error=%s",
+                runtime_request_id,
+                exc,
+                exc_info=True,
+            )
+
     def worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
         logger.info(f"Worker {self.gpu_id} ready to receive requests via shared memory")
 
         while self._running:
+            if self.worker.runtime_v2_runner is not None:
+                self._poll_runtime_v2_scheduler(timeout_s=0.0)
+                self._drain_runtime_v2_completions()
+                if not self._running:
+                    break
+
             msg = None
+            recv_timeout_s = None
+            if self.worker.runtime_v2_runner is not None:
+                recv_timeout_s = (
+                    self._runtime_v2_active_poll_s if self._pending_runtime_v2 else self._runtime_v2_idle_poll_s
+                )
             try:
-                msg = self.recv_message()
+                msg = self.recv_message(timeout_s=recv_timeout_s)
+            except (TimeoutError, zmq.error.Again):
+                continue
             except Exception as e:
                 logger.error(
                     f"Error receiving message in worker loop: {e}",
@@ -426,20 +753,42 @@ class WorkerProc:
                 )
                 continue
 
-            if msg is None or len(msg) == 0:
+            if msg is None:
+                continue
+            if hasattr(msg, "__len__") and len(msg) == 0:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
             # Route message based on type
             if isinstance(msg, dict) and msg.get("type") == "rpc":
+                if self._try_handle_runtime_v2_generate_rpc(msg):
+                    continue
                 try:
                     result, should_reply = self.execute_rpc(msg)
                     if should_reply:
-                        self.return_result(result)
+                        if msg.get("method") == "generate":
+                            self.return_result(
+                                {
+                                    "type": "generation_result",
+                                    "scheduler_req_id": msg.get("scheduler_req_id"),
+                                    "output": result,
+                                }
+                            )
+                        else:
+                            self.return_result(result)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result(DiffusionOutput(error=str(e)))
+                        if msg.get("method") == "generate":
+                            self.return_result(
+                                {
+                                    "type": "generation_result",
+                                    "scheduler_req_id": msg.get("scheduler_req_id"),
+                                    "output": DiffusionOutput(error=str(e)),
+                                }
+                            )
+                        else:
+                            self.return_result(DiffusionOutput(error=str(e)))
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
@@ -463,6 +812,7 @@ class WorkerProc:
                     logger.error(f"ZMQ error sending reply: {e}")
                     continue
 
+        self._fail_all_pending_runtime_v2(reason="worker shutdown")
         logger.info("event loop terminated.")
         try:
             self.worker.shutdown()
@@ -511,6 +861,13 @@ class WorkerWrapperBase:
         self,
         gpu_id: int,
         od_config: OmniDiffusionConfig,
+        *,
+        local_rank: int | None = None,
+        rank: int | None = None,
+        device_id: int | None = None,
+        world_size: int | None = None,
+        master_addr: str | None = None,
+        master_port: int | None = None,
         base_worker_class: type = DiffusionWorker,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
@@ -521,6 +878,12 @@ class WorkerWrapperBase:
         Args:
             gpu_id: GPU device ID
             od_config: OmniDiffusionConfig configuration
+            local_rank: Optional local rank override for distributed session
+            rank: Optional distributed rank override
+            device_id: Optional device ID override used for CUDA device binding
+            world_size: Optional distributed world size override
+            master_addr: Optional distributed master address override
+            master_port: Optional distributed master port override
             worker_extension_cls: Optional qualified name of worker extension class
             custom_pipeline_args: Optional arguments for custom pipeline initialization
         """
@@ -538,10 +901,17 @@ class WorkerWrapperBase:
         # since re_init_pipeline will handle it. This avoids allocating memory
         # through CuMemAllocator twice, which causes assertion failures in
         # sleep mode.
+        worker_local_rank = gpu_id if local_rank is None else int(local_rank)
+        worker_rank = gpu_id if rank is None else int(rank)
+        worker_device_id = gpu_id if device_id is None else int(device_id)
         self.worker = worker_class(
-            local_rank=gpu_id,
-            rank=gpu_id,
+            local_rank=worker_local_rank,
+            rank=worker_rank,
             od_config=od_config,
+            device_id=worker_device_id,
+            world_size=world_size,
+            master_addr=master_addr,
+            master_port=master_port,
             skip_load_model=(self.custom_pipeline_args is not None),
         )
 

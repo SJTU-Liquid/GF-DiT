@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import threading
 import time
+from dataclasses import dataclass
 from collections.abc import Iterable
 from typing import Any
 
@@ -10,8 +12,9 @@ import numpy as np
 import PIL.Image
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
     get_diffusion_post_process_func,
@@ -22,6 +25,15 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class CollectedDiffusionResult:
+    request: OmniDiffusionRequest
+    output: DiffusionOutput
+    preprocess_time: float
+    diffusion_engine_start_time: float
+    exec_total_time: float
 
 
 def supports_image_input(model_class_name: str) -> bool:
@@ -66,6 +78,8 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
+        self._pending_requests_lock = threading.Lock()
+        self._pending_requests: dict[str, tuple[OmniDiffusionRequest, float, float, float]] = {}
 
         try:
             self._dummy_run()
@@ -77,18 +91,89 @@ class DiffusionEngine:
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         diffusion_engine_start_time = time.perf_counter()
 
-        # Apply pre-processing if available
+        request, preprocess_time = self._prepare_request(request)
+
+        exec_start_time = time.perf_counter()
+        output = self.add_req_and_wait_for_response(request)
+        exec_total_time = time.perf_counter() - exec_start_time
+        return self._build_outputs(
+            request=request,
+            output=output,
+            preprocess_time=preprocess_time,
+            diffusion_engine_start_time=diffusion_engine_start_time,
+            exec_total_time=exec_total_time,
+        )
+
+    def submit(self, request: OmniDiffusionRequest) -> str:
+        diffusion_engine_start_time = time.perf_counter()
+        request, preprocess_time = self._prepare_request(request)
+        submission_id = self.submit_req(request)
+        submit_done_time = time.perf_counter()
+        with self._pending_requests_lock:
+            self._pending_requests[submission_id] = (
+                request,
+                preprocess_time,
+                diffusion_engine_start_time,
+                submit_done_time,
+            )
+        return submission_id
+
+    def collect(self, submission_id: str, timeout_s: float | None = None) -> list[OmniRequestOutput]:
+        collected = self.collect_raw(submission_id, timeout_s=timeout_s)
+        return self.finalize_collected(collected)
+
+    def collect_raw(
+        self,
+        submission_id: str,
+        timeout_s: float | None = None,
+    ) -> CollectedDiffusionResult:
+        with self._pending_requests_lock:
+            pending = self._pending_requests.get(submission_id)
+        if pending is None:
+            raise KeyError(f"Unknown diffusion submission id: {submission_id}")
+
+        request, preprocess_time, diffusion_engine_start_time, submit_done_time = pending
+        output = self.collect_req(submission_id, timeout_s=timeout_s)
+        exec_total_time = time.perf_counter() - submit_done_time
+        with self._pending_requests_lock:
+            self._pending_requests.pop(submission_id, None)
+        return CollectedDiffusionResult(
+            request=request,
+            output=output,
+            preprocess_time=preprocess_time,
+            diffusion_engine_start_time=diffusion_engine_start_time,
+            exec_total_time=exec_total_time,
+        )
+
+    def finalize_collected(
+        self,
+        collected: CollectedDiffusionResult,
+    ) -> list[OmniRequestOutput]:
+        return self._build_outputs(
+            request=collected.request,
+            output=collected.output,
+            preprocess_time=collected.preprocess_time,
+            diffusion_engine_start_time=collected.diffusion_engine_start_time,
+            exec_total_time=collected.exec_total_time,
+        )
+
+    def _prepare_request(self, request: OmniDiffusionRequest) -> tuple[OmniDiffusionRequest, float]:
         preprocess_time = 0.0
         if self.pre_process_func is not None:
             preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
             preprocess_time = time.perf_counter() - preprocess_start_time
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+        return request, preprocess_time
 
-        exec_start_time = time.perf_counter()
-        output = self.add_req_and_wait_for_response(request)
-        exec_total_time = time.perf_counter() - exec_start_time
-
+    def _build_outputs(
+        self,
+        request: OmniDiffusionRequest,
+        output: DiffusionOutput,
+        preprocess_time: float,
+        diffusion_engine_start_time: float,
+        exec_total_time: float,
+    ) -> list[OmniRequestOutput]:
         if output.error:
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
@@ -105,6 +190,14 @@ class DiffusionEngine:
                 )
                 for i, prompt in enumerate(request.prompts)
             ]
+
+        # runtime_v2 fetch_artifacts intentionally keeps DiffusionOutput.output
+        # as a SHM handle dict (see multiproc_worker._normalize_fetch_result and
+        # ipc.pack_diffusion_output_shm). The async serve path unpacks in its
+        # own helper; the sync DiffusionEngine.step path must do it here, or
+        # post_process_func will be handed a dict and explode with
+        # "'dict' has no attribute 'shape'".
+        unpack_diffusion_output_shm(output)
 
         postprocess_start_time = time.perf_counter()
         outputs = self.post_process_func(output.output) if self.post_process_func is not None else output.output
@@ -246,6 +339,14 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest):
         return self.executor.add_req(request)
+
+    def submit_req(self, request: OmniDiffusionRequest) -> str:
+        """Submit a request without blocking."""
+        return self.executor.submit_req(request)
+
+    def collect_req(self, request_id: str, timeout_s: float | None = None) -> DiffusionOutput:
+        """Collect a previously submitted request result."""
+        return self.executor.collect_req(request_id, timeout_s=timeout_s)
 
     def start_profile(self, trace_filename: str | None = None) -> None:
         """
@@ -440,6 +541,8 @@ class DiffusionEngine:
         )
 
     def close(self) -> None:
+        with self._pending_requests_lock:
+            self._pending_requests.clear()
         if hasattr(self, "executor"):
             self.executor.shutdown()
 

@@ -10,6 +10,7 @@ from collections.abc import Mapping
 import torch
 
 from vllm_omni.config.stage_config import StageConfigFactory
+from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
@@ -106,3 +107,116 @@ class TestCreateDefaultDiffusion:
         ea = stages[0]["engine_args"]
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
+
+    def test_runtime_v2_config_forwarded(self):
+        stages = StageConfigFactory.create_default_diffusion(
+            {
+                "model": "x",
+                "enable_runtime_v2": True,
+                "runtime_v2_denoise_chunk_size": 3,
+                "runtime_v2_scheduler_policy": "srtf",
+                "runtime_v2_collective_backend": "gfc",
+                "runtime_v2_group_sizes": "4,2,1,1",
+                "runtime_v2_groups_json": (
+                    '[{"size":4,"tp":4,"ulysses_degree":1,"ring_degree":1},'
+                    '{"size":2,"tp":2,"ulysses_degree":1,"ring_degree":1},'
+                    '{"size":1,"tp":1,"ulysses_degree":1,"ring_degree":1},'
+                    '{"size":1,"tp":1,"ulysses_degree":1,"ring_degree":1}]'
+                ),
+                "runtime_v2_dit_step_schedule": '[{"start":0,"end":2,"group_id":"g0"}]',
+            }
+        )
+        ea = dict(stages[0]["engine_args"])
+        assert ea["enable_runtime_v2"] is True
+        assert ea["runtime_v2_denoise_chunk_size"] == 3
+        assert ea["runtime_v2_scheduler_policy"] == "srtf"
+        assert ea["runtime_v2_collective_backend"] == "gfc"
+        assert ea["runtime_v2_group_sizes"] == "4,2,1,1"
+        assert isinstance(ea["runtime_v2_groups_json"], str)
+        assert isinstance(ea["runtime_v2_dit_step_schedule"], str)
+
+        od = OmniDiffusionConfig.from_kwargs(**ea)
+        assert od.enable_runtime_v2 is True
+        assert od.runtime_v2_denoise_chunk_size == 3
+        assert od.runtime_v2_scheduler_policy == "srtf"
+        assert od.runtime_v2_collective_backend == "gfc"
+        assert od.runtime_v2_group_sizes == [4, 2, 1, 1]
+        assert isinstance(od.runtime_v2_groups_json, list)
+        assert len(od.runtime_v2_groups_json) == 4
+        assert od.runtime_v2_dit_step_schedule == [{"start": 0, "end": 2, "group_id": "g0"}]
+
+
+class TestRuntimeV2StageConfigPrecedence:
+    """Regression tests for CLI-defaults versus YAML runtime_v2 settings."""
+
+    @staticmethod
+    def _runtime_v2_stage():
+        return create_config(
+            {
+                "stage_id": 0,
+                "stage_type": "diffusion",
+                "runtime": {"devices": "0,1"},
+                "engine_args": {
+                    "enable_runtime_v2": True,
+                    "runtime_v2_denoise_chunk_size": 8,
+                    "runtime_v2_scheduler_policy": "edf_best_fit",
+                    "runtime_v2_collective_backend": "gfc",
+                    "runtime_v2_gfc_max_collective_mb": 512,
+                },
+            }
+        )
+
+    def test_yaml_runtime_v2_settings_survive_omitted_cli_flags(self, monkeypatch) -> None:
+        from vllm_omni.entrypoints import omni as omni_module
+
+        stage = self._runtime_v2_stage()
+
+        def fake_loader(_model, _stage_configs_path, _kwargs, default_stage_cfg_factory=None):
+            del default_stage_cfg_factory
+            return "/tmp/stage.yaml", [stage]
+
+        monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", fake_loader)
+        omni_base = omni_module.OmniBase.__new__(omni_module.OmniBase)
+
+        _config_path, stage_configs = omni_base._resolve_stage_configs(
+            "test-model",
+            {"stage_configs_path": "/tmp/stage.yaml"},
+        )
+
+        engine_args = stage_configs[0].engine_args
+        assert engine_args.enable_runtime_v2 is True
+        assert engine_args.runtime_v2_denoise_chunk_size == 8
+        assert engine_args.runtime_v2_scheduler_policy == "edf_best_fit"
+        assert engine_args.runtime_v2_collective_backend == "gfc"
+        assert engine_args.runtime_v2_gfc_max_collective_mb == 512
+
+    def test_explicit_runtime_v2_kwargs_override_yaml(self, monkeypatch) -> None:
+        from vllm_omni.entrypoints import omni as omni_module
+
+        stage = self._runtime_v2_stage()
+
+        def fake_loader(_model, _stage_configs_path, _kwargs, default_stage_cfg_factory=None):
+            del default_stage_cfg_factory
+            return "/tmp/stage.yaml", [stage]
+
+        monkeypatch.setattr(omni_module, "load_and_resolve_stage_configs", fake_loader)
+        omni_base = omni_module.OmniBase.__new__(omni_module.OmniBase)
+
+        _config_path, stage_configs = omni_base._resolve_stage_configs(
+            "test-model",
+            {
+                "stage_configs_path": "/tmp/stage.yaml",
+                "enable_runtime_v2": False,
+                "runtime_v2_denoise_chunk_size": 1,
+                "runtime_v2_scheduler_policy": "fcfs",
+                "runtime_v2_collective_backend": "torch",
+                "runtime_v2_gfc_max_collective_mb": 128,
+            },
+        )
+
+        engine_args = stage_configs[0].engine_args
+        assert engine_args.enable_runtime_v2 is False
+        assert engine_args.runtime_v2_denoise_chunk_size == 1
+        assert engine_args.runtime_v2_scheduler_policy == "fcfs"
+        assert engine_args.runtime_v2_collective_backend == "torch"
+        assert engine_args.runtime_v2_gfc_max_collective_mb == 128

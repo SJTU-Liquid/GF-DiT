@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import json
 import os
 import random
 from collections.abc import Callable, Mapping
@@ -386,6 +387,41 @@ class OmniDiffusionConfig:
     # Compilation
     enforce_eager: bool = False
 
+    # Runtime v2 (task-graph scheduler) configuration.
+    # Currently only Wan2.2 is supported.
+    enable_runtime_v2: bool = False
+    runtime_v2_denoise_chunk_size: int = 1
+    # Number of postprocess+encode subprocesses to spawn per GPU worker. The
+    # runtime_v2 worker mode runs CPU postprocessing and video MP4 encoding in
+    # this subprocess pool so the API server event loop only does IO.
+    runtime_v2_postprocess_workers_per_gpu: int = 2
+    runtime_v2_scheduler_policy: str = "fcfs"
+    runtime_v2_collective_backend: str = "torch"
+    # GFC symmetric-memory buffer dial. max_collective_mb sets the upper bound
+    # on a single SP collective payload and pins that much symmetric memory per
+    # rank. Defaults match GFC's SymmetricCollectiveConfig defaults.
+    runtime_v2_gfc_max_collective_mb: int = 128
+    runtime_v2_group_sizes: list[int] | str | None = None
+    runtime_v2_groups_json: list[dict[str, Any]] | dict[str, Any] | str | None = None
+    runtime_v2_dit_step_schedule: list[dict[str, Any]] | dict[str, Any] | str | None = None
+    runtime_v2_edf_greedy_sp_sizes: list[int] | str | None = None
+    # Cost-model directory (one JSON per (tp, sp, ulysses, ring, cfg)) used by
+    # the edf_best_fit policy to estimate end-to-end finish time. If unset,
+    # edf_best_fit silently degrades to the same largest-fit behavior as
+    # edf_greedy.
+    runtime_v2_cost_model_dir: str | None = None
+    # Multi-group stage placement. Required when runtime_v2_scheduler_policy
+    # is "disaggregate" or "dynamic_step_fcfs"; ignored otherwise.
+    runtime_v2_disaggregate_aux_group_id: str | None = None
+    runtime_v2_disaggregate_dit_group_id: str | None = None
+    # wave_stress policy knobs. Default 5 leaves room for vllm-omni's own
+    # startup warmup (1 request, runs synchronously via runner.wait — would
+    # deadlock if held in the wave-collect pool) plus a typical benchmark
+    # --warmup-requests value. Operator should tune this to match
+    # (vllm-omni startup warmups: 1) + (benchmark warmup count).
+    runtime_v2_wave_stress_warmup_reqs: int = 5
+    runtime_v2_wave_stress_wave_size: int = 4
+
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
@@ -595,6 +631,75 @@ class OmniDiffusionConfig:
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
 
+        if self.runtime_v2_denoise_chunk_size < 1:
+            raise ValueError("runtime_v2_denoise_chunk_size must be >= 1")
+        if self.runtime_v2_postprocess_workers_per_gpu is None:
+            self.runtime_v2_postprocess_workers_per_gpu = 2
+        if self.runtime_v2_postprocess_workers_per_gpu < 1:
+            raise ValueError("runtime_v2_postprocess_workers_per_gpu must be >= 1")
+        self.runtime_v2_scheduler_policy = str(self.runtime_v2_scheduler_policy).lower()
+        if self.runtime_v2_scheduler_policy not in {
+            "fcfs",
+            "srtf",
+            "disaggregate",
+            "dynamic_step_fcfs",
+            "edf_greedy",
+            "edf_best_fit",
+            "wave_stress",
+        }:
+            raise ValueError(
+                "runtime_v2_scheduler_policy must be one of "
+                "('fcfs', 'srtf', 'disaggregate', 'dynamic_step_fcfs', 'edf_greedy', "
+                "'edf_best_fit', 'wave_stress'), "
+                f"got {self.runtime_v2_scheduler_policy!r}"
+            )
+        self.runtime_v2_collective_backend = str(self.runtime_v2_collective_backend or "torch").lower()
+        if self.runtime_v2_collective_backend not in {"torch", "gfc"}:
+            raise ValueError(
+                "runtime_v2_collective_backend must be one of ('torch', 'gfc'), "
+                f"got {self.runtime_v2_collective_backend!r}"
+            )
+        self.runtime_v2_gfc_max_collective_mb = int(self.runtime_v2_gfc_max_collective_mb)
+        if self.runtime_v2_gfc_max_collective_mb < 1:
+            raise ValueError(
+                f"runtime_v2_gfc_max_collective_mb must be >= 1, got {self.runtime_v2_gfc_max_collective_mb}"
+            )
+        self.runtime_v2_group_sizes = self._normalize_runtime_v2_group_sizes(self.runtime_v2_group_sizes)
+        self.runtime_v2_edf_greedy_sp_sizes = self._normalize_runtime_v2_group_sizes(
+            self.runtime_v2_edf_greedy_sp_sizes
+        )
+        self.runtime_v2_groups_json = self._normalize_runtime_v2_groups_json(self.runtime_v2_groups_json)
+        self.runtime_v2_dit_step_schedule = self._normalize_runtime_v2_dit_step_schedule(
+            self.runtime_v2_dit_step_schedule
+        )
+        if (
+            self.runtime_v2_scheduler_policy in {"edf_greedy", "edf_best_fit", "wave_stress"}
+            and self.runtime_v2_collective_backend != "gfc"
+        ):
+            raise ValueError(
+                f"runtime_v2_scheduler_policy={self.runtime_v2_scheduler_policy!r} "
+                "requires runtime_v2_collective_backend='gfc'"
+            )
+        if self.runtime_v2_scheduler_policy in {"disaggregate", "dynamic_step_fcfs"}:
+            if not self.runtime_v2_disaggregate_aux_group_id:
+                raise ValueError(
+                    f"runtime_v2_scheduler_policy={self.runtime_v2_scheduler_policy!r} requires "
+                    "runtime_v2_disaggregate_aux_group_id"
+                )
+            if not self.runtime_v2_disaggregate_dit_group_id:
+                raise ValueError(
+                    f"runtime_v2_scheduler_policy={self.runtime_v2_scheduler_policy!r} requires "
+                    "runtime_v2_disaggregate_dit_group_id"
+                )
+            if (
+                self.runtime_v2_disaggregate_aux_group_id
+                == self.runtime_v2_disaggregate_dit_group_id
+            ):
+                raise ValueError(
+                    "runtime_v2_disaggregate_aux_group_id and runtime_v2_disaggregate_dit_group_id "
+                    "must be distinct execution groups"
+                )
+
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
@@ -619,6 +724,127 @@ class OmniDiffusionConfig:
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
 
         return cls(**filtered_kwargs)
+
+    @staticmethod
+    def _normalize_runtime_v2_group_sizes(value: list[int] | str | None) -> list[int] | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            raw_parts = [part.strip() for part in value.split(",")]
+            parts = [part for part in raw_parts if part]
+            if not parts:
+                return None
+            try:
+                parsed = [int(part) for part in parts]
+            except ValueError as exc:
+                raise ValueError(f"runtime_v2_group_sizes contains non-integer values: {value!r}") from exc
+        elif isinstance(value, (list, tuple)):
+            try:
+                parsed = [int(part) for part in value]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"runtime_v2_group_sizes must contain integers, got: {value!r}") from exc
+        else:
+            raise ValueError(
+                "runtime_v2_group_sizes must be a list[int], tuple[int], "
+                f"or comma string, got {type(value)!r}"
+            )
+
+        if not parsed:
+            return None
+        if any(part <= 0 for part in parsed):
+            raise ValueError(f"runtime_v2_group_sizes must be positive integers, got {parsed!r}")
+        return parsed
+
+    @staticmethod
+    def _normalize_runtime_v2_groups_json(
+        value: list[dict[str, Any]] | dict[str, Any] | str | None,
+    ) -> list[dict[str, Any]] | None:
+        if value is None:
+            return None
+
+        parsed: Any = value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"runtime_v2_groups_json must be valid JSON, got: {value!r}") from exc
+
+        if isinstance(parsed, Mapping):
+            if "groups" in parsed:
+                parsed = parsed["groups"]
+            else:
+                raise ValueError("runtime_v2_groups_json object must contain key 'groups'")
+
+        if not isinstance(parsed, (list, tuple)):
+            raise ValueError("runtime_v2_groups_json must resolve to a JSON array of group objects")
+
+        groups: list[dict[str, Any]] = []
+        for index, item in enumerate(parsed):
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "runtime_v2_groups_json entries must be objects, "
+                    f"got {type(item)!r} at index {index}"
+                )
+            groups.append(dict(item))
+        return groups or None
+
+    @staticmethod
+    def _normalize_runtime_v2_dit_step_schedule(
+        value: list[dict[str, Any]] | dict[str, Any] | str | None,
+    ) -> list[dict[str, Any]] | None:
+        if value is None:
+            return None
+
+        parsed: Any = value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"runtime_v2_dit_step_schedule must be valid JSON, got: {value!r}") from exc
+
+        if isinstance(parsed, Mapping):
+            if "schedule" in parsed:
+                parsed = parsed["schedule"]
+            else:
+                raise ValueError("runtime_v2_dit_step_schedule object must contain key 'schedule'")
+
+        if not isinstance(parsed, (list, tuple)):
+            raise ValueError("runtime_v2_dit_step_schedule must resolve to a JSON array of schedule objects")
+
+        schedule: list[dict[str, Any]] = []
+        for index, item in enumerate(parsed):
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "runtime_v2_dit_step_schedule entries must be objects, "
+                    f"got {type(item)!r} at index {index}"
+                )
+            group_id = str(item.get("group_id", ""))
+            if not group_id:
+                raise ValueError(f"runtime_v2_dit_step_schedule[{index}] requires non-empty group_id")
+            try:
+                start = int(item.get("start", 0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"runtime_v2_dit_step_schedule[{index}].start must be an integer") from exc
+            raw_end = item.get("end")
+            if raw_end is None:
+                end = None
+            else:
+                try:
+                    end = int(raw_end)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"runtime_v2_dit_step_schedule[{index}].end must be an integer or null") from exc
+            if start < 0:
+                raise ValueError(f"runtime_v2_dit_step_schedule[{index}].start must be >= 0")
+            if end is not None and end <= start:
+                raise ValueError(f"runtime_v2_dit_step_schedule[{index}].end must be greater than start")
+            schedule.append({"start": start, "end": end, "group_id": group_id})
+        return schedule or None
 
 
 @dataclass

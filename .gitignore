@@ -153,19 +153,13 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# Claude
-CLAUDE.md
-.claude/
-
-# Codex
-AGENTS.md
-.codex/
+# Local-only: experiment data and scaffolding (not published)
+out/
+cost-model/
+docs/superpowers/
 
 # cursor
 .cursor/
-
-# scripts
-/scripts/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
@@ -223,6 +217,8 @@ datasets/
 *.csv
 *.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+!out/stress/*.json
+!scripts/**/*.json
 *.jsonl
 *.parquet
 
@@ -247,3 +243,7 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+*.mp4
+*.summary.txt
+wave_profiles/
+timeline*.png

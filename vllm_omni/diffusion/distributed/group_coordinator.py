@@ -13,6 +13,12 @@ from torch.distributed import Backend, ProcessGroup
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.distributed.collective_runtime import (
+    all_gather_into_tensor,
+    get_group_rank,
+    get_group_world_size,
+    make_logical_group,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -99,6 +105,7 @@ class GroupCoordinator:
         group_ranks: list[list[int]],
         local_rank: int,
         torch_distributed_backend: str | Backend,
+        allow_non_member: bool = False,
     ):
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -117,9 +124,9 @@ class GroupCoordinator:
                 self.device_group = device_group
                 self.cpu_group = cpu_group
 
-        assert self.cpu_group is not None
-        assert self.device_group is not None
-
+        if not allow_non_member:
+            assert self.cpu_group is not None
+            assert self.device_group is not None
         self.device = current_omni_platform.get_torch_device(local_rank)
 
     @property
@@ -213,7 +220,7 @@ class GroupCoordinator:
         input_size[0] *= world_size
         output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -545,6 +552,62 @@ class GroupCoordinator:
             self.cpu_group = None
 
 
+class LogicalGroupCoordinator(GroupCoordinator):
+    """GroupCoordinator-compatible logical group without torch subgroups."""
+
+    def __init__(
+        self,
+        group_ranks: list[list[int]],
+        local_rank: int,
+        torch_distributed_backend: str | Backend,
+        allow_non_member: bool = False,
+        group_id: str = "",
+    ):
+        del torch_distributed_backend
+        self.rank = torch.distributed.get_rank()
+        self.local_rank = local_rank
+        self.device_group = None
+        self.cpu_group = None
+        self.ranks = []
+        self.world_size = 0
+        self.rank_in_group = -1
+
+        for idx, ranks in enumerate(group_ranks):
+            if self.rank not in ranks:
+                continue
+            self.ranks = [int(rank) for rank in ranks]
+            self.world_size = len(self.ranks)
+            self.rank_in_group = self.ranks.index(self.rank)
+            logical_group_id = f"{group_id}:{idx}" if group_id else ""
+            self.device_group = make_logical_group(self.ranks, group_id=logical_group_id)
+            self.cpu_group = None
+            break
+
+        if not allow_non_member:
+            assert self.device_group is not None
+        self.device = current_omni_platform.get_torch_device(local_rank)
+
+    def all_reduce(self, input_: torch.Tensor, op=torch._C._distributed_c10d.ReduceOp.SUM) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        raise NotImplementedError("runtime_v2 GFC backend does not replace non-SP all_reduce in v1")
+
+    def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        raise NotImplementedError("runtime_v2 GFC backend does not implement gather in v1")
+
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
+        raise NotImplementedError("runtime_v2 GFC backend does not replace pipeline P2P in v1")
+
+    def recv(self, size: torch.Size, dtype: torch.dtype, src: int | None = None) -> torch.Tensor:
+        raise NotImplementedError("runtime_v2 GFC backend does not replace pipeline P2P in v1")
+
+    def destroy(self):
+        self.device_group = None
+        self.cpu_group = None
+
+
 class PipelineGroupCoordinator(GroupCoordinator):
     """
     available attributes:
@@ -569,6 +632,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         group_ranks: list[list[int]],
         local_rank: int,
         torch_distributed_backend: str | Backend,
+        allow_non_member: bool = False,
     ):
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -611,8 +675,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
                     self.device_group = device_group_0_1
                     self.cpu_group = cpu_group_0_1
 
-        assert self.cpu_group is not None
-        assert self.device_group is not None
+        if not allow_non_member:
+            assert self.cpu_group is not None
+            assert self.device_group is not None
 
         self.device = current_omni_platform.get_torch_device(local_rank)
 
@@ -635,7 +700,32 @@ class PipelineGroupCoordinator(GroupCoordinator):
             skip_device_group = torch.distributed.new_group(ranks, backend=torch_distributed_backend)
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
-        assert self.skip_device_group is not None
+        if not allow_non_member:
+            assert self.skip_device_group is not None
+
+    def destroy(self):
+        # The base destroy() only frees device_group/cpu_group, but a PP
+        # coordinator also creates per-direction groups (device_groups/cpu_groups
+        # for PP=2) and a skip_device_group via new_group. Without freeing them
+        # each model reload leaks those NCCL/gloo communicators. Dedup by id() so
+        # the primary device_group/cpu_group -- which alias device_groups[0] /
+        # cpu_groups[0] in the PP=2 case -- are not double-destroyed (the base
+        # frees them via super().destroy()).
+        already = {id(self.device_group), id(self.cpu_group)}
+        extra = list(self.device_groups or []) + list(self.cpu_groups or [])
+        if self.skip_device_group is not None:
+            extra.append(self.skip_device_group)
+        for grp in extra:
+            if grp is not None and id(grp) not in already:
+                already.add(id(grp))
+                try:
+                    torch.distributed.destroy_process_group(grp)
+                except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                    logger.warning("failed to destroy PP group: %s", exc)
+        self.device_groups = []
+        self.cpu_groups = []
+        self.skip_device_group = None
+        super().destroy()
 
     def reset_buffer(self):
         self.recv_tasks_queue = []
@@ -911,13 +1001,23 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         group_ranks: list[list[int]],
         local_rank: int,
         torch_distributed_backend: str | Backend,
+        allow_non_member: bool = False,
         **kwargs,
     ):
         super().__init__(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=torch_distributed_backend,
+            allow_non_member=allow_non_member,
         )
+        if allow_non_member and self.device_group is None:
+            self.ulysses_group = None
+            self.ring_group = None
+            self.ulysses_world_size = 1
+            self.ulysses_rank = 0
+            self.ring_world_size = 1
+            self.ring_rank = 0
+            return
 
         ulysses_group = kwargs.get("ulysses_group", None)
         ring_group = kwargs.get("ring_group", None)
@@ -932,7 +1032,69 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
 
-        self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
-        self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
-        self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
-        self.ring_rank = torch.distributed.get_rank(self.ring_group)
+        self.ulysses_world_size = get_group_world_size(self.ulysses_group)
+        self.ulysses_rank = get_group_rank(self.ulysses_group)
+        self.ring_world_size = get_group_world_size(self.ring_group)
+        self.ring_rank = get_group_rank(self.ring_group)
+
+    def destroy(self):
+        # The base destroy() only frees device_group/cpu_group. The ulysses_group
+        # and ring_group are separate NCCL communicators created via new_group for
+        # this SP coordinator; without freeing them here each SP group leaks two
+        # communicators (~hundreds of MB each) that accumulate across model
+        # reloads. Guard against None and against aliasing the base groups so we
+        # never double-destroy a shared ProcessGroup.
+        already = {id(self.device_group), id(self.cpu_group)}
+        for attr in ("ulysses_group", "ring_group"):
+            grp = getattr(self, attr, None)
+            if grp is not None and id(grp) not in already:
+                already.add(id(grp))
+                try:
+                    torch.distributed.destroy_process_group(grp)
+                except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                    logger.warning("failed to destroy SP %s: %s", attr, exc)
+            setattr(self, attr, None)
+        super().destroy()
+
+
+class LogicalSequenceParallelGroupCoordinator(LogicalGroupCoordinator):
+    def __init__(
+        self,
+        group_ranks: list[list[int]],
+        local_rank: int,
+        torch_distributed_backend: str | Backend,
+        allow_non_member: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            group_ranks=group_ranks,
+            local_rank=local_rank,
+            torch_distributed_backend=torch_distributed_backend,
+            allow_non_member=allow_non_member,
+            group_id=str(kwargs.get("group_id", "sp")),
+        )
+        if allow_non_member and self.device_group is None:
+            self.ulysses_group = None
+            self.ring_group = None
+            self.ulysses_world_size = 1
+            self.ulysses_rank = 0
+            self.ring_world_size = 1
+            self.ring_rank = 0
+            return
+
+        ulysses_group = kwargs.get("ulysses_group", None)
+        ring_group = kwargs.get("ring_group", None)
+        if ulysses_group is None:
+            raise RuntimeError(
+                "Please pass argument 'ulysses_group' when calling init func of LogicalSequenceParallelGroupCoordinator"
+            )
+        if ring_group is None:
+            raise RuntimeError(
+                "Please pass argument 'ring_group' when calling init func of LogicalSequenceParallelGroupCoordinator"
+            )
+        self.ulysses_group = ulysses_group
+        self.ring_group = ring_group
+        self.ulysses_world_size = get_group_world_size(self.ulysses_group)
+        self.ulysses_rank = get_group_rank(self.ulysses_group)
+        self.ring_world_size = get_group_world_size(self.ring_group)
+        self.ring_rank = get_group_rank(self.ring_group)

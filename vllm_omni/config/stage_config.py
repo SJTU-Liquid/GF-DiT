@@ -272,12 +272,24 @@ class StageConfigFactory:
         Returns:
             List containing a single config dict for the diffusion stage.
         """
-        # Calculate devices based on parallel config
-        devices = "0"
-        if "parallel_config" in kwargs:
-            num_devices = kwargs["parallel_config"].world_size
-            for i in range(1, num_devices):
-                devices += f",{i}"
+        # Resolve stage-visible device count for default diffusion stage.
+        # Priority:
+        # 1) explicit --num-gpus,
+        # 2) parallel_config.world_size,
+        # 3) fallback single device.
+        num_devices = 1
+        raw_num_gpus = kwargs.get("num_gpus", None)
+        if raw_num_gpus is not None:
+            num_devices = int(raw_num_gpus)
+        elif "parallel_config" in kwargs and kwargs["parallel_config"] is not None:
+            parallel_cfg = kwargs["parallel_config"]
+            if isinstance(parallel_cfg, dict):
+                num_devices = int(parallel_cfg.get("world_size", 1))
+            else:
+                num_devices = int(getattr(parallel_cfg, "world_size", 1))
+        if num_devices < 1:
+            raise ValueError(f"num_gpus/world_size must be >= 1, got {num_devices}")
+        devices = ",".join(str(i) for i in range(num_devices))
 
         engine_args: dict[str, Any] = {}
         for key, value in kwargs.items():

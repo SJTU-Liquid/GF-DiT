@@ -7,6 +7,7 @@ This module provides Pydantic models that follow the OpenAI DALL-E API specifica
 for text-to-image generation, with vllm-omni specific extensions.
 """
 
+import json
 from enum import Enum
 from typing import Any
 
@@ -108,6 +109,40 @@ class ImageGenerationRequest(BaseModel):
     # VAE memory optimizations (set at model init, included for completeness)
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
+
+    # Generic pass-through to OmniDiffusionSamplingParams.extra_args. Mirrors
+    # VideoGenerationRequest.extra_args so runtime_v2 EDF/best-fit policies
+    # receive per-request priority, deadline, arrival, request_class metadata
+    # on the image path too. Clients may send a JSON-encoded string; the
+    # validator parses it back to a dict.
+    extra_args: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Pass-through metadata copied into OmniDiffusionSamplingParams.extra_args. "
+            "Recognized runtime_v2 keys: runtime_v2_priority, runtime_v2_deadline_ms, "
+            "runtime_v2_arrival_ms, runtime_v2_request_class. Clients may submit a JSON string."
+        ),
+    )
+
+    @field_validator("extra_args", mode="before")
+    @classmethod
+    def _parse_extra_args(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"extra_args must be a dict or a JSON-encoded dict, got invalid JSON: {exc}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"extra_args JSON must decode to a dict, got {type(parsed).__name__}"
+                )
+            return parsed
+        return value
 
 
 class ImageData(BaseModel):

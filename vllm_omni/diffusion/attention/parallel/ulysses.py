@@ -4,21 +4,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
-import torch.distributed as dist
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
+from vllm_omni.diffusion.distributed.collective_runtime import (
+    all_gather_tensor_list,
+    get_group_world_size,
+)
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 
 
 @dataclass(frozen=True, slots=True)
 class _UlyssesCtx(ParallelAttentionContext):
     """Per-forward context for Ulysses sequence-parallel attention."""
 
-    ulysses_pg: dist.ProcessGroup
+    ulysses_pg: Any
     scatter_idx: int
     gather_idx: int
     use_sync: bool
@@ -44,11 +49,29 @@ class UlyssesParallelAttention:
         gather_idx: int,
         use_sync: bool,
     ) -> None:
-        self._sp_group = sp_group
-        self._ulysses_pg = sp_group.ulysses_group
+        # ``sp_group`` is intentionally NOT stored. runtime_v2 can swap the
+        # active SP group at task-dispatch time (e.g. when a request migrates
+        # from g_sp1_r3 to edf_sp2_r2_3 via _maybe_activate_group_session).
+        # Caching ``sp_group`` / ``sp_group.ulysses_group`` here would freeze a
+        # reference to whichever group was active at strategy construction
+        # (typically the world SP group). A subsequent task dispatched on a
+        # sub-group would still issue all_to_all against the stale world
+        # group, and ranks outside the sub-group would never enter the
+        # collective → barrier hang. Read via ``get_sp_group()`` on every call
+        # instead; sp_group below is discarded and kept only for back-compat
+        # with the factory signature.
+        del sp_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
+
+    @property
+    def _sp_group(self) -> SequenceParallelGroupCoordinator:
+        return get_sp_group()
+
+    @property
+    def _ulysses_pg(self):
+        return self._sp_group.ulysses_group
 
     @property
     def enabled(self) -> bool:
@@ -224,8 +247,8 @@ class UlyssesParallelAttention:
             # AllGather along dim 2.
             # Ensure tensor is contiguous for all_gather (slicing may create non-contiguous views)
             output_joint = output_joint.contiguous()
-            gathered_joint = [torch.zeros_like(output_joint) for _ in range(dist.get_world_size(ctx.ulysses_pg))]
-            dist.all_gather(gathered_joint, output_joint, group=ctx.ulysses_pg)
+            gathered_joint = [torch.zeros_like(output_joint) for _ in range(get_group_world_size(ctx.ulysses_pg))]
+            all_gather_tensor_list(gathered_joint, output_joint, group=ctx.ulysses_pg)
             output_joint = torch.cat(gathered_joint, dim=2)
 
             # 3. Recombine

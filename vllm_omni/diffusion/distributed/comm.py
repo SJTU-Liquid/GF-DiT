@@ -8,6 +8,12 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from vllm_omni.diffusion.distributed.collective_runtime import (
+    all_to_all_single,
+    get_group_rank,
+    get_group_ranks,
+    get_group_world_size,
+)
 from vllm_omni.platforms import current_omni_platform
 
 __all__ = ["all_to_all_4D", "all_to_all_5D", "SeqAllToAll4D", "SeqAllToAll5D", "RingComm"]
@@ -31,7 +37,7 @@ def all_to_all_4D(
     """
     assert input.dim() == 4, f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
 
-    seq_world_size = dist.get_world_size(group)
+    seq_world_size = get_group_world_size(group)
 
     if scatter_idx == 2 and gather_idx == 1:
         # input (torch.tensor): a tensor sharded along dim 1 (bs, seqlen/P, hc, hs) output: (bs, seqlen, hc/P, hs)
@@ -48,7 +54,7 @@ def all_to_all_4D(
         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
 
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -66,7 +72,7 @@ def all_to_all_4D(
         bs, seqlen, shard_hc, hs = input.shape
         hc = shard_hc * seq_world_size
         shard_seqlen = seqlen // seq_world_size
-        seq_world_size = dist.get_world_size(group)
+        seq_world_size = get_group_world_size(group)
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen, hc/P, hs) -reshape-> (bs, P, seq_len/P, hc/P, hs) -transpose(0, 3)->
@@ -83,7 +89,7 @@ def all_to_all_4D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -136,7 +142,7 @@ def all_to_all_5D(
     """
     assert input.dim() == 5, f"input must be 5D tensor, got {input.dim()} and shape {input.shape}"
 
-    seq_world_size = dist.get_world_size(group)
+    seq_world_size = get_group_world_size(group)
 
     if scatter_idx == 3 and gather_idx == 1:
         # input (torch.tensor): a tensor sharded along dim 1 (bs, seqlen/P, 3, hc, hs) output: (bs, seqlen, 3, hc/P, hs)
@@ -155,7 +161,7 @@ def all_to_all_5D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, seq_len/P, 3, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, 3, bs, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -173,7 +179,7 @@ def all_to_all_5D(
         bs, seqlen, _, shard_hc, hs = input.shape
         hc = shard_hc * seq_world_size
         shard_seqlen = seqlen // seq_world_size
-        seq_world_size = dist.get_world_size(group)
+        seq_world_size = get_group_world_size(group)
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen, 3, hc/P, hs) -reshape-> (bs, P, seq_len/P, 3, hc/P, hs) -transpose(0, 4)->
@@ -190,7 +196,7 @@ def all_to_all_5D(
         # https://pytorch.org/docs/stable/distributed.html#torch.distributed.all_to_all_single
         # (P, bs x hc/P, seqlen/P, hs) scatter seqlen -all2all-> (P, bs x seq_len/P, hc/P, hs) scatter head
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            all_to_all_single(output, input_t, group=group)
             if use_sync:
                 current_omni_platform.synchronize()
         else:
@@ -228,19 +234,16 @@ class SeqAllToAll5D(torch.autograd.Function):
 class RingComm:
     """Ring communication utility for Ring Attention P2P communication."""
 
-    def __init__(self, process_group: dist.ProcessGroup):
+    def __init__(self, process_group: Any):
         self._process_group = process_group
         self._ops = []
-        self.rank = dist.get_rank(self._process_group)
-        self.world_size = dist.get_world_size(self._process_group)
+        self.ranks = get_group_ranks(self._process_group)
+        self.rank = get_group_rank(self._process_group)
+        self.world_size = len(self.ranks)
         self._reqs = None
 
-        self.send_rank = (self.rank + 1) % self.world_size
-        self.recv_rank = (self.rank - 1) % self.world_size
-
-        if process_group is not None:
-            self.send_rank = dist.get_global_rank(self._process_group, self.send_rank)
-            self.recv_rank = dist.get_global_rank(self._process_group, self.recv_rank)
+        self.send_rank = self.ranks[(self.rank + 1) % self.world_size]
+        self.recv_rank = self.ranks[(self.rank - 1) % self.world_size]
 
     def send_recv(self, to_send: torch.Tensor, recv_tensor: torch.Tensor | None = None) -> torch.Tensor:
         # Ensure to_send is contiguous for P2P
@@ -256,8 +259,8 @@ class RingComm:
             if not res.is_contiguous():
                 res = res.contiguous()
 
-        send_op = dist.P2POp(dist.isend, to_send, self.send_rank, group=self._process_group)
-        recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=self._process_group)
+        send_op = dist.P2POp(dist.isend, to_send, self.send_rank, group=None)
+        recv_op = dist.P2POp(dist.irecv, res, self.recv_rank, group=None)
         self._ops.append(send_op)
         self._ops.append(recv_op)
         return res

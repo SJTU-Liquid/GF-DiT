@@ -28,6 +28,9 @@ If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
 
+from collections.abc import Mapping
+from typing import Any
+
 import torch
 import torch.distributed
 import vllm.distributed.parallel_state as vllm_parallel_state
@@ -36,11 +39,21 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.collective_runtime import (
+    LogicalGroupHandle,
+    is_torch_process_group,
+    make_logical_group,
+    register_static_gfc_subgroup,
+    runtime_v2_uses_gfc,
+    shutdown_runtime_v2_collective_runtime,
+)
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 from .group_coordinator import (
     GroupCoordinator,
+    LogicalGroupCoordinator,
+    LogicalSequenceParallelGroupCoordinator,
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
 )
@@ -60,6 +73,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
+_RUNTIME_V2_GROUP_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 def generate_masked_orthogonal_rank_groups(
@@ -480,6 +494,9 @@ def init_model_parallel_group(
     local_rank: int,
     backend: str,
     parallel_mode: str,
+    allow_non_member: bool = False,
+    logical_group: bool = False,
+    group_id: str = "",
     **kwargs,
 ) -> GroupCoordinator:
     assert parallel_mode in [
@@ -491,17 +508,36 @@ def init_model_parallel_group(
         "classifier_free_guidance",
         "fully_shard",
     ], f"parallel_mode {parallel_mode} is not supported"
+    if logical_group:
+        if parallel_mode == "sequence":
+            return LogicalSequenceParallelGroupCoordinator(
+                group_ranks=group_ranks,
+                local_rank=local_rank,
+                torch_distributed_backend=backend,
+                allow_non_member=allow_non_member,
+                group_id=group_id or parallel_mode,
+                **kwargs,
+            )
+        return LogicalGroupCoordinator(
+            group_ranks=group_ranks,
+            local_rank=local_rank,
+            torch_distributed_backend=backend,
+            allow_non_member=allow_non_member,
+            group_id=group_id or parallel_mode,
+        )
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
+            allow_non_member=allow_non_member,
         )
     elif parallel_mode == "sequence":
         return SequenceParallelGroupCoordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
+            allow_non_member=allow_non_member,
             **kwargs,
         )
     else:
@@ -509,6 +545,7 @@ def init_model_parallel_group(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
+            allow_non_member=allow_non_member,
         )
 
 
@@ -523,6 +560,62 @@ def init_dit_group(
 def get_dit_group():
     assert _DIT is not None, "DIT group is not initialized"
     return _DIT
+
+
+def get_runtime_v2_model_parallel_session(group_id: str) -> dict[str, Any]:
+    try:
+        return _RUNTIME_V2_GROUP_SESSIONS[str(group_id)]
+    except KeyError:
+        raise KeyError(f"runtime_v2 model-parallel session not found for group_id={group_id!r}") from None
+
+
+def activate_runtime_v2_model_parallel_session(group_id: str) -> None:
+    session = get_runtime_v2_model_parallel_session(group_id)
+    global _WORLD, _DP, _CFG, _PP, _SP, _FS, _DIT
+    _WORLD = session["world"]
+    _DP = session["dp"]
+    _CFG = session["cfg"]
+    _PP = session["pp"]
+    _SP = session["sp"]
+    _FS = session["fs"]
+    _DIT = session["dit"]
+    vllm_parallel_state._DP = _DP
+    vllm_parallel_state._PP = _PP
+    vllm_parallel_state._TP = session["tp"]
+    if hasattr(vllm_parallel_state, "_EP"):
+        vllm_parallel_state._EP = session.get("ep")
+
+
+def ensure_runtime_v2_model_parallel_session(group_spec: Mapping[str, Any], backend: str | None = None) -> None:
+    """Register one runtime_v2 model-parallel session on demand.
+
+    This is intended for the GFC backend, where dynamic groups are logical
+    host-side metadata and do not require a world-wide torch ``new_group``
+    sequence. The torch backend still requires static session construction.
+    """
+    spec = _normalize_runtime_v2_execution_group(group_spec, 0)
+    group_id = str(spec["group_id"])
+    if group_id in _RUNTIME_V2_GROUP_SESSIONS:
+        return
+    if not runtime_v2_uses_gfc():
+        raise RuntimeError(
+            f"runtime_v2 group {group_id!r} was not initialized; dynamic on-demand groups require "
+            "runtime_v2_collective_backend='gfc'"
+        )
+    if backend is None:
+        backend = current_omni_platform.dist_backend
+    rank = torch.distributed.get_rank()
+    local_rank = get_world_group().local_rank
+    session = _build_runtime_v2_group_session(
+        spec=spec,
+        rank=rank,
+        local_rank=local_rank,
+        backend=backend,
+        logical_group=True,
+    )
+    if session is None:
+        return
+    _RUNTIME_V2_GROUP_SESSIONS[group_id] = session
 
 
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
@@ -866,8 +959,445 @@ def initialize_model_parallel(
     init_dit_group(dit_parallel_size, backend)
 
 
+def _normalize_runtime_v2_execution_group(raw_spec: Mapping[str, Any], index: int) -> dict[str, Any]:
+    # Normalize one execution-group spec into validated integer dimensions and
+    # explicit rank list. This keeps downstream group construction strict and
+    # deterministic.
+    group_id = str(raw_spec.get("group_id", f"g{index}"))
+    ranks_raw = raw_spec.get("ranks")
+    if not isinstance(ranks_raw, list) or not ranks_raw:
+        raise ValueError(f"runtime_v2 execution group {group_id!r} must provide non-empty 'ranks' list")
+    ranks = [int(rank) for rank in ranks_raw]
+    tp = int(raw_spec.get("tp", 1))
+    sp = int(raw_spec.get("sp", 1))
+    cfg = int(raw_spec.get("cfg", 1))
+    ulysses_degree = int(raw_spec.get("ulysses_degree", 1))
+    ring_degree = int(raw_spec.get("ring_degree", 1))
+    if tp < 1 or sp < 1 or cfg < 1:
+        raise ValueError(f"runtime_v2 execution group {group_id!r} must have tp/sp/cfg >= 1")
+    if ulysses_degree < 1 or ring_degree < 1:
+        raise ValueError(f"runtime_v2 execution group {group_id!r} must have ulysses_degree/ring_degree >= 1")
+    if sp != ulysses_degree * ring_degree:
+        raise ValueError(
+            f"runtime_v2 execution group {group_id!r} has invalid sequence parallel config: "
+            f"sp={sp} != ulysses_degree({ulysses_degree}) * ring_degree({ring_degree})"
+        )
+    if len(ranks) != tp * sp * cfg:
+        raise ValueError(
+            f"runtime_v2 execution group {group_id!r} has invalid size: len(ranks)={len(ranks)} "
+            f"!= tp({tp})*sp({sp})*cfg({cfg})={tp * sp * cfg}"
+        )
+    return {
+        "group_id": group_id,
+        "ranks": ranks,
+        "tp": tp,
+        "sp": sp,
+        "cfg": cfg,
+        "ulysses_degree": ulysses_degree,
+        "ring_degree": ring_degree,
+    }
+
+
+def _remap_local_rank_groups(local_groups: list[list[int]], global_ranks: list[int]) -> list[list[int]]:
+    # Convert local rank ids (0..N-1 inside one execution group) to global
+    # world ranks.
+    mapped: list[list[int]] = []
+    for local_group in local_groups:
+        mapped.append([global_ranks[int(local_rank)] for local_rank in local_group])
+    return mapped
+
+
+def _create_sp_subgroups_for_one_sp_group(
+    *,
+    sp_group_ranks: list[int],
+    ulysses_degree: int,
+    ring_degree: int,
+    rank: int,
+    backend: str,
+    use_ulysses_low: bool = True,
+) -> tuple[Any | None, Any | None]:
+    # Build Ulysses/Ring process groups for one SP slice. Caller may invoke
+    # this for all slices; only the slice containing `rank` returns non-None
+    # local handles for the current process.
+    if len(sp_group_ranks) != ulysses_degree * ring_degree:
+        raise ValueError(
+            f"invalid SP group size {len(sp_group_ranks)} for "
+            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}"
+        )
+    num_ulysses_pgs = ring_degree
+    num_ring_pgs = ulysses_degree
+    local_ulysses_pg = None
+    local_ring_pg = None
+
+    if use_ulysses_low:
+        for i in range(num_ulysses_pgs):
+            ulysses_ranks = sp_group_ranks[i * ulysses_degree : (i + 1) * ulysses_degree]
+            group = torch.distributed.new_group(ulysses_ranks, backend=backend)
+            if rank in ulysses_ranks:
+                local_ulysses_pg = group
+        for i in range(num_ring_pgs):
+            ring_ranks = sp_group_ranks[i::num_ring_pgs]
+            group = torch.distributed.new_group(ring_ranks, backend=backend)
+            if rank in ring_ranks:
+                local_ring_pg = group
+    else:
+        for i in range(num_ring_pgs):
+            ring_ranks = sp_group_ranks[i * ring_degree : (i + 1) * ring_degree]
+            group = torch.distributed.new_group(ring_ranks, backend=backend)
+            if rank in ring_ranks:
+                local_ring_pg = group
+        for i in range(num_ulysses_pgs):
+            ulysses_ranks = sp_group_ranks[i::num_ulysses_pgs]
+            group = torch.distributed.new_group(ulysses_ranks, backend=backend)
+            if rank in ulysses_ranks:
+                local_ulysses_pg = group
+
+    return local_ulysses_pg, local_ring_pg
+
+
+def _create_logical_sp_subgroups_for_one_sp_group(
+    *,
+    sp_group_ranks: list[int],
+    ulysses_degree: int,
+    ring_degree: int,
+    rank: int,
+    use_ulysses_low: bool = True,
+    group_id_prefix: str = "",
+) -> tuple[LogicalGroupHandle | None, LogicalGroupHandle | None]:
+    if len(sp_group_ranks) != ulysses_degree * ring_degree:
+        raise ValueError(
+            f"invalid SP group size {len(sp_group_ranks)} for "
+            f"ulysses_degree={ulysses_degree}, ring_degree={ring_degree}"
+        )
+    num_ulysses_pgs = ring_degree
+    num_ring_pgs = ulysses_degree
+    local_ulysses_pg = None
+    local_ring_pg = None
+
+    if use_ulysses_low:
+        for i in range(num_ulysses_pgs):
+            ulysses_ranks = sp_group_ranks[i * ulysses_degree : (i + 1) * ulysses_degree]
+            if rank in ulysses_ranks:
+                local_ulysses_pg = make_logical_group(
+                    ulysses_ranks,
+                    group_id=f"{group_id_prefix}:ulysses:{i}",
+                )
+        for i in range(num_ring_pgs):
+            ring_ranks = sp_group_ranks[i::num_ring_pgs]
+            if rank in ring_ranks:
+                local_ring_pg = make_logical_group(
+                    ring_ranks,
+                    group_id=f"{group_id_prefix}:ring:{i}",
+                )
+    else:
+        for i in range(num_ring_pgs):
+            ring_ranks = sp_group_ranks[i * ring_degree : (i + 1) * ring_degree]
+            if rank in ring_ranks:
+                local_ring_pg = make_logical_group(
+                    ring_ranks,
+                    group_id=f"{group_id_prefix}:ring:{i}",
+                )
+        for i in range(num_ulysses_pgs):
+            ulysses_ranks = sp_group_ranks[i::num_ulysses_pgs]
+            if rank in ulysses_ranks:
+                local_ulysses_pg = make_logical_group(
+                    ulysses_ranks,
+                    group_id=f"{group_id_prefix}:ulysses:{i}",
+                )
+
+    return local_ulysses_pg, local_ring_pg
+
+
+def _validate_gfc_runtime_v2_group(spec: Mapping[str, Any]) -> None:
+    if int(spec["tp"]) != 1:
+        raise ValueError(
+            "runtime_v2_collective_backend='gfc' does not replace tensor-parallel all_reduce in v1; "
+            f"group {spec['group_id']!r} must use tp=1"
+        )
+    if int(spec["cfg"]) != 1:
+        raise ValueError(
+            "runtime_v2_collective_backend='gfc' does not replace CFG collectives in v1; "
+            f"group {spec['group_id']!r} must use cfg=1"
+        )
+    if len(spec["ranks"]) > 16:
+        raise ValueError(
+            "runtime_v2_collective_backend='gfc' supports execution groups of at most 16 ranks in v1; "
+            f"group {spec['group_id']!r} has {len(spec['ranks'])} ranks"
+        )
+
+
+def _build_runtime_v2_group_session(
+    *,
+    spec: Mapping[str, Any],
+    rank: int,
+    local_rank: int,
+    backend: str,
+    logical_group: bool,
+) -> dict[str, Any] | None:
+    group_ranks = list(spec["ranks"])
+    is_member = rank in group_ranks
+    if logical_group and not is_member:
+        return None
+    if logical_group:
+        _validate_gfc_runtime_v2_group(spec)
+
+    rank_generator = RankGenerator(
+        tp=int(spec["tp"]),
+        sp=int(spec["sp"]),
+        pp=1,
+        cfg=int(spec["cfg"]),
+        dp=1,
+        fs=1,
+        order="tp-sp-pp-cfg-dp",
+        rank_offset=0,
+    )
+    dp_group_ranks = _remap_local_rank_groups(rank_generator.get_ranks("dp"), group_ranks)
+    cfg_group_ranks = _remap_local_rank_groups(rank_generator.get_ranks("cfg"), group_ranks)
+    pp_group_ranks = _remap_local_rank_groups(rank_generator.get_ranks("pp"), group_ranks)
+    mapped_sp_group_ranks = _remap_local_rank_groups(rank_generator.get_ranks("sp"), group_ranks)
+    sp_group_ranks = mapped_sp_group_ranks
+    tp_group_ranks = _remap_local_rank_groups(rank_generator.get_ranks("tp"), group_ranks)
+    fs_group_ranks = _remap_local_rank_groups(rank_generator.get_ranks("fs", independent_ranks=True), group_ranks)
+
+    local_ulysses_pg = None
+    local_ring_pg = None
+    for idx, one_sp_group_ranks in enumerate(mapped_sp_group_ranks):
+        if logical_group:
+            ulysses_pg, ring_pg = _create_logical_sp_subgroups_for_one_sp_group(
+                sp_group_ranks=one_sp_group_ranks,
+                ulysses_degree=int(spec["ulysses_degree"]),
+                ring_degree=int(spec["ring_degree"]),
+                rank=rank,
+                group_id_prefix=f"{spec['group_id']}:sp:{idx}",
+            )
+        else:
+            ulysses_pg, ring_pg = _create_sp_subgroups_for_one_sp_group(
+                sp_group_ranks=one_sp_group_ranks,
+                ulysses_degree=int(spec["ulysses_degree"]),
+                ring_degree=int(spec["ring_degree"]),
+                rank=rank,
+                backend=backend,
+            )
+        if ulysses_pg is not None:
+            local_ulysses_pg = ulysses_pg
+        if ring_pg is not None:
+            local_ring_pg = ring_pg
+
+    group_prefix = str(spec["group_id"])
+    dp = init_model_parallel_group(
+        group_ranks=dp_group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        parallel_mode="data",
+        allow_non_member=True,
+        logical_group=logical_group,
+        group_id=f"{group_prefix}:dp",
+    )
+    cfg = init_model_parallel_group(
+        group_ranks=cfg_group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        parallel_mode="classifier_free_guidance",
+        allow_non_member=True,
+        logical_group=logical_group,
+        group_id=f"{group_prefix}:cfg",
+    )
+    pp = init_model_parallel_group(
+        group_ranks=pp_group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        parallel_mode="pipeline",
+        allow_non_member=True,
+        logical_group=logical_group,
+        group_id=f"{group_prefix}:pp",
+    )
+    sp = init_model_parallel_group(
+        group_ranks=sp_group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        parallel_mode="sequence",
+        allow_non_member=True,
+        logical_group=logical_group,
+        group_id=f"{group_prefix}:sp",
+        ulysses_group=local_ulysses_pg,
+        ring_group=local_ring_pg,
+    )
+    tp = init_model_parallel_group(
+        group_ranks=tp_group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        parallel_mode="tensor",
+        allow_non_member=True,
+        logical_group=logical_group,
+        group_id=f"{group_prefix}:tp",
+    )
+    fs = init_model_parallel_group(
+        group_ranks=fs_group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        parallel_mode="fully_shard",
+        allow_non_member=True,
+        logical_group=logical_group,
+        group_id=f"{group_prefix}:fs",
+    )
+    if logical_group:
+        dit_group = make_logical_group(group_ranks, group_id=f"{group_prefix}:dit")
+    else:
+        dit_group = torch.distributed.new_group(ranks=group_ranks, backend=backend)
+
+    if not is_member:
+        return None
+    if local_ulysses_pg is None or local_ring_pg is None:
+        raise RuntimeError(
+            f"failed to resolve ulysses/ring subgroup for rank {rank} "
+            f"in runtime_v2 group {spec['group_id']!r}"
+        )
+    return {
+        "world": get_world_group(),
+        "dp": dp,
+        "cfg": cfg,
+        "pp": pp,
+        "sp": sp,
+        "tp": tp,
+        "fs": fs,
+        "dit": dit_group,
+        "ep": None,
+    }
+
+
+def initialize_model_parallel_from_execution_groups(
+    *,
+    execution_groups: list[dict[str, Any]],
+    current_group_id: str | None = None,
+    enable_expert_parallel: bool = False,
+    backend: str | None = None,
+) -> None:
+    """Initialize model-parallel groups from explicit runtime_v2 execution groups.
+
+    All workers share one global torch.distributed world. Runtime v2 may place a
+    worker in multiple execution groups, so this path builds one complete
+    TP/SP/CFG/PP/FS/DIT session per group and activates `current_group_id` as
+    the legacy global view used by existing model code.
+    """
+    if backend is None:
+        backend = current_omni_platform.dist_backend
+    assert torch.distributed.is_initialized()
+
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    if not execution_groups:
+        raise ValueError("runtime_v2 shared-world mode requires non-empty execution_groups")
+
+    normalized_groups: list[dict[str, Any]] = []
+    all_group_ranks: list[int] = []
+    current_group_found = current_group_id is None
+    rank_in_current_group = current_group_id is None
+    rank_covered = False
+    for idx, raw_group in enumerate(execution_groups):
+        if not isinstance(raw_group, Mapping):
+            raise ValueError(
+                f"runtime_v2 execution_groups entry #{idx} must be a mapping, got {type(raw_group)!r}"
+            )
+        spec = _normalize_runtime_v2_execution_group(raw_group, idx)
+        normalized_groups.append(spec)
+        all_group_ranks.extend(spec["ranks"])
+        if current_group_id is not None and spec["group_id"] == current_group_id:
+            current_group_found = True
+            if rank in spec["ranks"]:
+                rank_in_current_group = True
+        if rank in spec["ranks"]:
+            rank_covered = True
+
+    if not rank_covered:
+        raise ValueError(f"rank {rank} does not belong to any runtime_v2 execution group")
+    if not current_group_found:
+        raise ValueError(f"current_group_id={current_group_id!r} does not exist in runtime_v2 execution_groups")
+    if not rank_in_current_group:
+        raise ValueError(
+            f"rank {rank} does not belong to current_group_id={current_group_id!r} "
+            "in runtime_v2 execution_groups"
+        )
+    expected_ranks = set(range(world_size))
+    actual_ranks = set(all_group_ranks)
+    missing_ranks = sorted(expected_ranks - actual_ranks)
+    extra_ranks = sorted(actual_ranks - expected_ranks)
+    if missing_ranks:
+        raise ValueError(f"runtime_v2 execution_groups missing ranks from global world: {missing_ranks!r}")
+    if extra_ranks:
+        raise ValueError(f"runtime_v2 execution_groups contain out-of-range ranks: {extra_ranks!r}")
+
+    global _RUNTIME_V2_GROUP_SESSIONS
+    if _RUNTIME_V2_GROUP_SESSIONS:
+        raise RuntimeError("runtime_v2 model-parallel sessions are already initialized")
+    if _DP is not None or _CFG is not None or _PP is not None or _SP is not None or vllm_parallel_state._TP is not None:
+        raise RuntimeError("model-parallel groups are already initialized")
+
+    local_rank = get_world_group().local_rank
+    # Static initialization: every rank participates, so torch.distributed.new_group
+    # works correctly. Only the on-demand ensure_runtime_v2_model_parallel_session
+    # path goes through the pure-logical branch (where non-members must skip).
+    sessions: dict[str, dict[str, Any]] = {}
+    for spec in normalized_groups:
+        session = _build_runtime_v2_group_session(
+            spec=spec,
+            rank=rank,
+            local_rank=local_rank,
+            backend=backend,
+            logical_group=False,
+        )
+        if session is not None:
+            sessions[spec["group_id"]] = session
+
+    # When GFC is the active backend, side-attach GFC group descriptors to the
+    # SP-side torch subgroups so comm.py can route all_gather / all_to_all
+    # through the symmetric-memory path while everything else (TP all_reduce,
+    # VAE gather/broadcast, ring P2P, PP send/recv) keeps using torch.
+    if runtime_v2_uses_gfc():
+        for session in sessions.values():
+            sp_coord = session.get("sp")
+            if sp_coord is None:
+                continue
+            for pg in (sp_coord.device_group, sp_coord.ulysses_group, sp_coord.ring_group):
+                if pg is not None and is_torch_process_group(pg):
+                    register_static_gfc_subgroup(pg)
+
+    if enable_expert_parallel:
+        raise NotImplementedError(
+            "runtime_v2 shared-world initialization currently does not support expert parallel groups"
+        )
+
+    if not sessions:
+        raise RuntimeError(f"rank {rank} did not initialize any runtime_v2 group session")
+    active_group_id = str(current_group_id) if current_group_id is not None else next(iter(sessions))
+    if active_group_id not in sessions:
+        raise RuntimeError(
+            f"rank {rank} does not have a runtime_v2 session for active group_id={active_group_id!r}"
+        )
+    _RUNTIME_V2_GROUP_SESSIONS = sessions
+    activate_runtime_v2_model_parallel_session(active_group_id)
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    global _RUNTIME_V2_GROUP_SESSIONS
+    if _RUNTIME_V2_GROUP_SESSIONS:
+        destroyed: set[int] = set()
+        for session in _RUNTIME_V2_GROUP_SESSIONS.values():
+            for key in ("dp", "cfg", "pp", "sp", "tp", "fs"):
+                group = session.get(key)
+                if group is None or id(group) in destroyed:
+                    continue
+                destroyed.add(id(group))
+                group.destroy()
+            dit_group = session.get("dit")
+            if dit_group is not None and id(dit_group) not in destroyed:
+                destroyed.add(id(dit_group))
+                if is_torch_process_group(dit_group):
+                    torch.distributed.destroy_process_group(dit_group)
+        _RUNTIME_V2_GROUP_SESSIONS.clear()
+
     global _DP
     if _DP:
         _DP.destroy()
@@ -901,9 +1431,14 @@ def destroy_model_parallel():
         _FS.destroy()
     _FS = None
 
+    global _DIT
+    _DIT = None
+
 
 def destroy_distributed_environment():
-    global _WORLD
+    global _WORLD, _RUNTIME_V2_GROUP_SESSIONS
+    _RUNTIME_V2_GROUP_SESSIONS.clear()
+    shutdown_runtime_v2_collective_runtime()
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None

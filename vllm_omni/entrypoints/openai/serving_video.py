@@ -19,7 +19,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationResponse,
 )
-from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64
+from vllm_omni.entrypoints.openai.video_api_utils import encode_video_base64, normalize_video_outputs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -122,6 +122,8 @@ class OmniOpenAIServingVideo:
         )
         if request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
+        if request.extra_args:
+            gen_params.extra_args.update(request.extra_args)
 
         self._apply_lora(request.lora, gen_params)
 
@@ -134,6 +136,16 @@ class OmniOpenAIServingVideo:
         )
 
         result = await self._run_generation(prompt, gen_params, reference_id)
+        pre_encoded = self._extract_pre_encoded_video_b64(result)
+        if pre_encoded is not None:
+            logger.info(
+                "Video response served pre-encoded from postprocess pool (%d clip(s))",
+                len(pre_encoded),
+            )
+            return VideoGenerationResponse(
+                created=int(time.time()),
+                data=[VideoData(b64_json=b64) for b64 in pre_encoded],
+            )
         _t_encode_start = time.perf_counter()
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
@@ -256,30 +268,26 @@ class OmniOpenAIServingVideo:
 
     @staticmethod
     def _normalize_video_outputs(videos: Any) -> list[Any]:
-        if videos is None:
-            return []
-        if hasattr(videos, "ndim") and videos.ndim == 5:
-            return [videos[i] for i in range(videos.shape[0])]
-        if isinstance(videos, list):
-            if not videos:
-                return []
-            first = videos[0]
-            if hasattr(first, "ndim") and first.ndim == 5:
-                flattened: list[Any] = []
-                for item in videos:
-                    if hasattr(item, "ndim") and item.ndim == 5:
-                        flattened.extend([item[i] for i in range(item.shape[0])])
-                    else:
-                        flattened.append(item)
-                return flattened
-            if isinstance(first, list):
-                return videos
-            if hasattr(first, "ndim") and first.ndim == 3:
-                return [videos]
-            if isinstance(first, Image.Image):
-                return [videos]
-            return videos
-        return [videos]
+        return normalize_video_outputs(videos)
+
+    @staticmethod
+    def _extract_pre_encoded_video_b64(result: Any) -> list[str] | None:
+        """Return base64 MP4 clips if the postprocess pool already encoded them.
+
+        The runtime_v2 postprocess subprocess encodes video off the event loop
+        and stows the result in custom_output['video_b64']; when present the
+        API server skips its own encode entirely.
+        """
+        custom = getattr(result, "custom_output", None)
+        if not custom:
+            request_output = getattr(result, "request_output", None)
+            custom = getattr(request_output, "custom_output", None)
+        if not custom:
+            return None
+        video_b64 = custom.get("video_b64")
+        if not video_b64:
+            return None
+        return list(video_b64)
 
     def _extract_video_outputs(self, result: Any) -> list[Any]:
         videos = None

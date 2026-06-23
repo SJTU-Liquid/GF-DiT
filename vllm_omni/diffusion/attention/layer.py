@@ -63,46 +63,79 @@ class Attention(nn.Module):
         self.use_sync = use_sync
         self.causal = causal
 
-        self.use_ring = False
-        self.ring_pg = None
         self.ring_runner = None
+        self._ring_runner_cache_key = None
+        self._parallel_strategy_cache_key = None
+        self._parallel_strategy_cache = None
 
         try:
             config = get_forward_context().omni_diffusion_config
             self.backend_pref = config.attention_backend
-            if config.parallel_config.ring_degree > 1:
-                self.use_ring = True
-                try:
-                    sp_group = get_sp_group()
-                    self.ring_pg = sp_group.ring_group
-                    self.ring_runner = RingParallelAttention(sp_group)
-                except Exception:
-                    self.use_ring = False
-                    self.ring_runner = None
         except Exception:
-            self.use_ring = False
-            self.ring_runner = None
-
-        self.parallel_strategy = build_parallel_attention_strategy(
-            scatter_idx=scatter_idx,
-            gather_idx=gather_idx,
-            use_sync=use_sync,
-        )
+            pass
         # Fallback strategy when SP is not active (outside sharded regions)
         self._no_parallel_strategy = NoParallelAttention()
 
     def _get_active_parallel_strategy(self):
-        """Get the parallel strategy based on current SP active state.
+        """Get the parallel strategy for the currently active runtime group.
 
         Returns NoParallelAttention if we're outside an SP sharded region
         (e.g., in noise_refiner/context_refiner before unified_prepare in Z-Image).
-        This avoids unnecessary SP communication for layers not covered by _sp_plan.
+        runtime_v2 may otherwise switch this worker from an SP4 DiT task to an
+        SP2 DiT task from another request without a RESHARD on this worker, so
+        the strategy type must be selected from the live group/config per call.
         """
         if is_forward_context_available():
             ctx = get_forward_context()
             if not ctx.sp_active:
                 return self._no_parallel_strategy
-        return self.parallel_strategy
+
+        key = self._parallel_strategy_key()
+        if key != self._parallel_strategy_cache_key or self._parallel_strategy_cache is None:
+            self._parallel_strategy_cache = build_parallel_attention_strategy(
+                scatter_idx=self.scatter_idx,
+                gather_idx=self.gather_idx,
+                use_sync=self.use_sync,
+            )
+            self._parallel_strategy_cache_key = key
+        return self._parallel_strategy_cache
+
+    def _parallel_strategy_key(self):
+        try:
+            config = get_forward_context().omni_diffusion_config
+            parallel_config = config.parallel_config
+            sp_group = get_sp_group()
+            return (
+                int(getattr(parallel_config, "sequence_parallel_size", 1) or 1),
+                int(getattr(parallel_config, "ulysses_degree", 1) or 1),
+                int(getattr(parallel_config, "ring_degree", 1) or 1),
+                int(getattr(sp_group, "world_size", 1) or 1),
+                int(getattr(sp_group, "ulysses_world_size", 1) or 1),
+                int(getattr(sp_group, "ring_world_size", 1) or 1),
+            )
+        except Exception:
+            return None
+
+    def _get_active_ring_runner(self):
+        try:
+            config = get_forward_context().omni_diffusion_config
+            if int(getattr(config.parallel_config, "ring_degree", 1) or 1) <= 1:
+                return None
+            sp_group = get_sp_group()
+            if int(getattr(sp_group, "ring_world_size", 1) or 1) <= 1:
+                return None
+            key = (
+                int(getattr(config.parallel_config, "ring_degree", 1) or 1),
+                int(getattr(sp_group, "world_size", 1) or 1),
+                int(getattr(sp_group, "ulysses_world_size", 1) or 1),
+                int(getattr(sp_group, "ring_world_size", 1) or 1),
+            )
+            if key != self._ring_runner_cache_key or self.ring_runner is None:
+                self.ring_runner = RingParallelAttention(sp_group)
+                self._ring_runner_cache_key = key
+            return self.ring_runner
+        except Exception:
+            return None
 
     def forward(
         self,
@@ -120,8 +153,9 @@ class Attention(nn.Module):
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
         # 2. Kernel Execution (Computation)
-        if self.use_ring and strategy is not self._no_parallel_strategy:
-            out = self._run_ring_attention(query, key, value, attn_metadata)
+        ring_runner = self._get_active_ring_runner()
+        if ring_runner is not None and strategy is not self._no_parallel_strategy:
+            out = self._run_ring_attention(ring_runner, query, key, value, attn_metadata)
         else:
             out = self._run_local_attention(query, key, value, attn_metadata)
 
@@ -142,11 +176,7 @@ class Attention(nn.Module):
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
 
-    def _run_ring_attention(self, query, key, value, attn_metadata):
-        # Delegate to RingParallelAttention strategy if available
-        if self.ring_runner is not None:
-            return self.ring_runner.run_attention(
-                query, key, value, attn_metadata, softmax_scale=self.softmax_scale, causal=self.causal
-            )
-
-        raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
+    def _run_ring_attention(self, ring_runner, query, key, value, attn_metadata):
+        return ring_runner.run_attention(
+            query, key, value, attn_metadata, softmax_scale=self.softmax_scale, causal=self.causal
+        )

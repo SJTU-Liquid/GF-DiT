@@ -267,3 +267,41 @@ def encode_video_base64(video: Any, fps: int, audio: Any | None = None, audio_sa
     """Encode a video (frames/array/tensor) to base64 MP4."""
     video_bytes = _encode_video_bytes(video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate)
     return base64.b64encode(video_bytes).decode("utf-8")
+
+
+def normalize_video_outputs(videos: Any) -> list[Any]:
+    """Flatten diffusion video outputs into a list of per-video frame sequences."""
+    if videos is None:
+        return []
+    if hasattr(videos, "ndim") and videos.ndim == 5:
+        return [videos[i] for i in range(videos.shape[0])]
+    if isinstance(videos, list):
+        if not videos:
+            return []
+        first = videos[0]
+        if hasattr(first, "ndim") and first.ndim == 5:
+            flattened: list[Any] = []
+            for item in videos:
+                if hasattr(item, "ndim") and item.ndim == 5:
+                    flattened.extend([item[i] for i in range(item.shape[0])])
+                else:
+                    flattened.append(item)
+            return flattened
+        if isinstance(first, list):
+            return videos
+        if hasattr(first, "ndim") and first.ndim == 3:
+            return [videos]
+        if isinstance(first, Image.Image):
+            return [videos]
+        return videos
+    return [videos]
+
+
+def encode_request_output_videos_b64(images: Any, fps: int) -> list[str]:
+    """Normalize diffusion video frame outputs and encode each to a base64 MP4 string.
+
+    Used by the runtime_v2 postprocess subprocess pool to keep MP4 encoding off
+    the API server event loop. Audio muxing is intentionally not handled here;
+    audio requests fall back to the API-server encode path.
+    """
+    return [encode_video_base64(video, fps=fps) for video in normalize_video_outputs(images)]

@@ -27,6 +27,7 @@ do not exercise the full model-registry pipeline.
 import os
 import pickle
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -54,6 +55,55 @@ def update_environment_variables(envs_dict: dict[str, str]):
 def seed_everything(seed: int):
     torch.manual_seed(seed)
     current_omni_platform.manual_seed(seed)
+
+
+def test_attention_reselects_parallel_strategy_when_runtime_group_changes(monkeypatch) -> None:
+    attention = Attention.__new__(Attention)
+    attention.scatter_idx = 2
+    attention.gather_idx = 1
+    attention.use_sync = False
+    attention._no_parallel_strategy = object()
+    attention._parallel_strategy_cache_key = None
+    attention._parallel_strategy_cache = None
+
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            sequence_parallel_size=4,
+            ulysses_degree=4,
+            ring_degree=1,
+        )
+    )
+    sp_group = SimpleNamespace(
+        world_size=4,
+        ulysses_world_size=4,
+        ring_world_size=1,
+    )
+    built: list[tuple[int, int]] = []
+
+    def fake_get_sp_group():
+        return sp_group
+
+    def fake_build_parallel_attention_strategy(*, scatter_idx, gather_idx, use_sync):
+        built.append((cfg.parallel_config.sequence_parallel_size, sp_group.world_size))
+        return f"strategy-sp{sp_group.world_size}"
+
+    monkeypatch.setattr("vllm_omni.diffusion.attention.layer.get_sp_group", fake_get_sp_group)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.layer.build_parallel_attention_strategy",
+        fake_build_parallel_attention_strategy,
+    )
+
+    with set_forward_context(omni_diffusion_config=cfg):
+        assert attention._get_active_parallel_strategy() == "strategy-sp4"
+
+        cfg.parallel_config.sequence_parallel_size = 2
+        cfg.parallel_config.ulysses_degree = 2
+        sp_group.world_size = 2
+        sp_group.ulysses_world_size = 2
+
+        assert attention._get_active_parallel_strategy() == "strategy-sp2"
+
+    assert built == [(4, 4), (2, 2)]
 
 
 class TestAttentionModel(torch.nn.Module):

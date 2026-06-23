@@ -275,12 +275,45 @@ class OmniBase:
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
+        num_gpus_override = kwargs.get("num_gpus", None)
+        diffusion_force_override_keys = (
+            "enable_runtime_v2",
+            "runtime_v2_denoise_chunk_size",
+            "runtime_v2_postprocess_workers_per_gpu",
+            "runtime_v2_scheduler_policy",
+            "runtime_v2_collective_backend",
+            "runtime_v2_gfc_max_collective_mb",
+            "runtime_v2_group_sizes",
+            "runtime_v2_groups_json",
+            "runtime_v2_dit_step_schedule",
+            "runtime_v2_edf_greedy_sp_sizes",
+            "runtime_v2_cost_model_dir",
+            "runtime_v2_disaggregate_aux_group_id",
+            "runtime_v2_disaggregate_dit_group_id",
+            "runtime_v2_wave_stress_warmup_reqs",
+            "runtime_v2_wave_stress_wave_size",
+        )
         for cfg in stage_configs:
             try:
                 if getattr(cfg, "stage_type", None) != "diffusion":
                     continue
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
                     cfg.engine_args = create_config({})
+                # Force critical runtime_v2 knobs from CLI to win over YAML/defaults.
+                for key in diffusion_force_override_keys:
+                    value = kwargs.get(key, None)
+                    if value is not None:
+                        cfg.engine_args[key] = value
+                # Keep diffusion worker count and runtime visible devices aligned
+                # with explicit CLI --num-gpus, so runtime_v2 topology sees the
+                # intended number of workers.
+                if num_gpus_override is not None:
+                    num_devices = int(num_gpus_override)
+                    if num_devices < 1:
+                        raise ValueError(f"num_gpus must be >= 1, got {num_devices}")
+                    cfg.engine_args.num_gpus = num_devices
+                    if hasattr(cfg, "runtime") and cfg.runtime is not None:
+                        cfg.runtime.devices = ",".join(str(i) for i in range(num_devices))
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]
@@ -358,9 +391,27 @@ class OmniBase:
         # Phase 1 optimization: for a single diffusion stage in async mode,
         # run the engine directly in the orchestrator process to eliminate
         # the stage worker subprocess and its IPC serialization overhead.
+        #
+        # NOTE: runtime_v2 expects entrypoint-style concurrent request submit +
+        # external poll/collect semantics. Inline mode serializes submit/collect
+        # via single-thread executors in AsyncOmni, which collapses concurrency
+        # and can hide runtime_v2 scheduling effects (e.g., SRTF reordering).
+        # Therefore we force non-inline execution when runtime_v2 is enabled.
         if len(self.stage_list) == 1 and self.stage_list[0].stage_type == "diffusion" and self.is_async:
-            self._init_inline_diffusion_engine(model, self.stage_configs[0], kwargs)
-            return
+            stage0_engine_args = getattr(self.stage_configs[0], "engine_args", None)
+            if hasattr(stage0_engine_args, "get"):
+                runtime_v2_enabled = bool(stage0_engine_args.get("enable_runtime_v2", False))
+            else:
+                runtime_v2_enabled = bool(getattr(stage0_engine_args, "enable_runtime_v2", False))
+            if runtime_v2_enabled:
+                logger.info(
+                    "[%s] Inline diffusion mode disabled because runtime_v2 is enabled; "
+                    "using stage worker entrypoint scheduling.",
+                    self._name,
+                )
+            else:
+                self._init_inline_diffusion_engine(model, self.stage_configs[0], kwargs)
+                return
 
         if self.worker_backend == "ray":
             self._queue_cls = get_ray_queue_class()

@@ -30,8 +30,15 @@ def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
 
     import numpy as np
 
-    tensor = tensor.detach().cpu().contiguous()
-    arr = tensor.numpy()
+    pinned_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
+    pinned_tensor.copy_(tensor, non_blocking=True)
+    torch.cuda.current_stream().synchronize()  # Ensure the copy is complete before accessing pinned memory
+    # numpy has no bfloat16 dtype: transport bf16 as raw uint16 and restore the
+    # torch dtype on unpack. Without this the shm pack raises ("unsupported
+    # ScalarType BFloat16") and the caller falls back to pickling the *CUDA*
+    # tensor via CUDA IPC, which OOMs the postprocess consumer on a near-full GPU.
+    np_src = pinned_tensor.view(torch.uint16) if pinned_tensor.dtype == torch.bfloat16 else pinned_tensor
+    arr = np_src.numpy()
     nbytes = arr.nbytes
     shm = shared_memory.SharedMemory(create=True, size=nbytes)
     shm_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf[:nbytes])
@@ -59,6 +66,8 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
         np_dtype = np.dtype(handle["numpy_dtype"])
         arr = np.ndarray(handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]])
         tensor = torch.from_numpy(arr.copy())
+        if handle.get("torch_dtype") == "torch.bfloat16":
+            tensor = tensor.view(torch.bfloat16)
     finally:
         shm.close()
         shm.unlink()

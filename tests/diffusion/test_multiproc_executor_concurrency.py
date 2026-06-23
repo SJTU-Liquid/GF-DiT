@@ -3,6 +3,7 @@
 
 import queue
 import threading
+from collections import deque
 from unittest.mock import Mock, patch
 
 import pytest
@@ -19,8 +20,13 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _tagged_output(tag: str) -> DiffusionOutput:
-    """Return a ``DiffusionOutput`` identifiable by its *error* field."""
-    return DiffusionOutput(output=torch.tensor([0]), error=tag)
+    """Return a *successful* ``DiffusionOutput`` identifiable by a custom_output tag.
+
+    The tag lives in custom_output, not error: collect_req treats a non-empty
+    error field as a worker failure and raises RuntimeError, so a success result
+    must leave error unset.
+    """
+    return DiffusionOutput(output=torch.tensor([0]), custom_output={"tag": tag})
 
 
 def _mock_request(tag: str) -> Mock:
@@ -39,6 +45,14 @@ def _make_scheduler():
     sched = Scheduler()
     sched.num_workers = 1
     sched._lock = threading.Lock()
+    # Mirror Scheduler.initialize(): dequeue_rpc_response/collect_req serialize
+    # result-queue reads on a dedicated _recv_lock separate from _lock.
+    sched._recv_lock = threading.Lock()
+    sched._sync_generation_lock = threading.Lock()
+    sched._submission_counter = 0
+    sched._submitted_request_ids = set()
+    sched._completed_generation_outputs = {}
+    sched._pending_rpc_responses = deque()
 
     req_q: queue.Queue = queue.Queue()
     res_q: queue.Queue = queue.Queue()
@@ -47,7 +61,21 @@ def _make_scheduler():
     mock_mq.enqueue = req_q.put
 
     mock_rmq = Mock()
-    mock_rmq.dequeue = lambda timeout=None: res_q.get(timeout=timeout if timeout else 10)
+
+    def _dequeue(timeout=None):
+        # The real MessageQueue.dequeue raises TimeoutError on timeout (which
+        # _dequeue_result_message catches); a bare queue.Queue raises queue.Empty,
+        # which would propagate uncaught and crash the poll loop. Translate it so
+        # the helper honours the same contract.
+        try:
+            if timeout is None:
+                return res_q.get(timeout=10)
+            # queue.Queue does not accept negative timeout.
+            return res_q.get(timeout=max(0, timeout))
+        except queue.Empty as exc:
+            raise TimeoutError("result queue empty") from exc
+
+    mock_rmq.dequeue = _dequeue
 
     sched.mq = mock_mq
     sched.result_mq = mock_rmq
@@ -65,6 +93,11 @@ def _make_executor(scheduler):
     executor.scheduler = scheduler
     executor._closed = False
     executor._processes = []
+    # _init_executor is patched out above, so mirror the attributes it would set
+    # on the legacy (non-runtime_v2) path: collective_rpc reads runtime_v2_runner
+    # first and serializes on _rpc_lock.
+    executor.runtime_v2_runner = None
+    executor._rpc_lock = threading.Lock()
     return executor
 
 
@@ -80,6 +113,14 @@ def _start_worker(req_q, res_q, count=2):
             args = req.get("args", ())
             if method == "generate" and args and hasattr(args[0], "request_ids"):
                 tag = f"result_for_{args[0].request_ids[0]}"
+                res_q.put(
+                    {
+                        "type": "generation_result",
+                        "scheduler_req_id": req.get("scheduler_req_id"),
+                        "output": _tagged_output(tag),
+                    }
+                )
+                continue
             elif args:
                 tag = f"result_for_{args[0]}"
             else:
@@ -145,8 +186,8 @@ class TestConcurrentAddReqBug:
 
         # With correct (locked) implementation both assertions hold.
         # The bug causes them to be swapped.
-        assert results["A"].error == "result_for_A"
-        assert results["B"].error == "result_for_B"
+        assert results["A"].custom_output["tag"] == "result_for_A"
+        assert results["B"].custom_output["tag"] == "result_for_B"
 
 
 # ──────────────── bug-reproduction: concurrent collective_rpc ─────────────
@@ -187,8 +228,8 @@ class TestConcurrentCollectiveRpcBug:
         tb.join(10)
         wt.join(5)
 
-        assert results["A"].error == "result_for_call_A"
-        assert results["B"].error == "result_for_call_B"
+        assert results["A"].custom_output["tag"] == "result_for_call_A"
+        assert results["B"].custom_output["tag"] == "result_for_call_B"
 
 
 # ──────── bug-reproduction: add_req vs collective_rpc concurrently ────────
@@ -226,8 +267,8 @@ class TestConcurrentAddReqVsCollectiveRpcBug:
         wt.join(5)
 
         assert isinstance(results["A"], DiffusionOutput)
-        assert results["A"].error == "result_for_A"
-        assert results["B"].error == "result_for_call_B"
+        assert results["A"].custom_output["tag"] == "result_for_A"
+        assert results["B"].custom_output["tag"] == "result_for_call_B"
 
 
 # ─────────────── backward-compatibility (serial) tests ────────────────────
@@ -248,7 +289,7 @@ class TestSerialOperations:
         wt.join(5)
 
         assert isinstance(result, DiffusionOutput)
-        assert result.error == "result_for_X"
+        assert result.custom_output["tag"] == "result_for_X"
 
     def test_serial_add_req_multiple_sequential(self):
         sched, req_q, res_q = _make_scheduler()
@@ -256,7 +297,7 @@ class TestSerialOperations:
 
         for tag in ("one", "two", "three"):
             out = sched.add_req(_mock_request(tag))
-            assert out.error == f"result_for_{tag}"
+            assert out.custom_output["tag"] == f"result_for_{tag}"
 
         wt.join(5)
 
@@ -272,7 +313,7 @@ class TestSerialOperations:
         )
         wt.join(5)
 
-        assert result.error == "result_for_Y"
+        assert result.custom_output["tag"] == "result_for_Y"
 
     def test_serial_collective_rpc_all_ranks(self):
         """``collective_rpc`` without *unique_reply_rank* collects
@@ -289,8 +330,8 @@ class TestSerialOperations:
         results = executor.collective_rpc("ping", args=("multi",))
 
         assert len(results) == 2
-        assert results[0].error == "rank0"
-        assert results[1].error == "rank1"
+        assert results[0].custom_output["tag"] == "rank0"
+        assert results[1].custom_output["tag"] == "rank1"
 
     def test_serial_add_req_then_collective_rpc(self):
         sched, req_q, res_q = _make_scheduler()
@@ -305,8 +346,41 @@ class TestSerialOperations:
         )
         wt.join(5)
 
-        assert gen_out.error == "result_for_gen"
-        assert rpc_out.error == "result_for_rpc"
+        assert gen_out.custom_output["tag"] == "result_for_gen"
+        assert rpc_out.custom_output["tag"] == "result_for_rpc"
+
+    def test_submit_collect_handles_out_of_order_generation_results(self):
+        sched, req_q, res_q = _make_scheduler()
+        req_a = _mock_request("A")
+        req_b = _mock_request("B")
+        sid_a = sched.submit_req(req_a)
+        sid_b = sched.submit_req(req_b)
+
+        msg_a = req_q.get(timeout=5)
+        msg_b = req_q.get(timeout=5)
+        sid_from_a = msg_a.get("scheduler_req_id")
+        sid_from_b = msg_b.get("scheduler_req_id")
+
+        # Return B first then A to verify request-id routing.
+        res_q.put(
+            {
+                "type": "generation_result",
+                "scheduler_req_id": sid_from_b,
+                "output": _tagged_output("result_for_B"),
+            }
+        )
+        res_q.put(
+            {
+                "type": "generation_result",
+                "scheduler_req_id": sid_from_a,
+                "output": _tagged_output("result_for_A"),
+            }
+        )
+
+        out_b = sched.collect_req(sid_b, timeout_s=2.0)
+        out_a = sched.collect_req(sid_a, timeout_s=2.0)
+        assert out_b.custom_output["tag"] == "result_for_B"
+        assert out_a.custom_output["tag"] == "result_for_A"
 
     def test_serial_add_req_error_propagation(self):
         """``add_req`` should raise when the worker reports an error."""
@@ -409,6 +483,24 @@ class TestCollectiveRpcTimeoutWhileLockHeld:
         with pytest.raises(TimeoutError):
             executor.collective_rpc("health_check", timeout=0.5)
 
+    def test_rpc_times_out_when_rpc_lock_is_held(self):
+        """A timed ``collective_rpc`` must fail fast on the executor ``_rpc_lock``
+        (bounded by the caller's deadline) instead of being wedged indefinitely
+        behind another RPC that holds it while blocked on an unresponsive worker.
+        """
+        sched, req_q, res_q = _make_scheduler()
+        executor = _make_executor(sched)
+
+        # Hold the RPC lock for the duration of the call (stands in for a
+        # concurrent collective_rpc that acquired it and is blocked on a dead
+        # worker). The timed call must give up on the lock, not hang.
+        executor._rpc_lock.acquire()
+        try:
+            with pytest.raises(TimeoutError, match="RPC lock"):
+                executor.collective_rpc("health", timeout=0.5)
+        finally:
+            executor._rpc_lock.release()
+
     def test_rpc_without_timeout_still_waits_for_lock(self):
         """When no timeout is given, ``collective_rpc`` should still wait
         for the lock (blocking) — existing behaviour preserved.
@@ -439,4 +531,4 @@ class TestCollectiveRpcTimeoutWhileLockHeld:
         )
         t.join(5)
 
-        assert result.error == "ok"
+        assert result.custom_output["tag"] == "ok"

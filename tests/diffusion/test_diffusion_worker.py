@@ -10,11 +10,17 @@ This module tests the DiffusionWorker implementation:
 - wake_up: Waking worker from sleep mode
 """
 
+from unittest.mock import call
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.diffusion.worker.diffusion_worker import (
+    _PendingRuntimeV2Submission,
+    DiffusionWorker,
+    WorkerProc,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -29,6 +35,9 @@ def mock_od_config(mocker: MockerFixture):
     config.cache_backend = None
     config.cache_config = None
     config.model = "test-model"
+    config.model_class_name = "WanPipeline"
+    config.enable_runtime_v2 = False
+    config.runtime_v2_denoise_chunk_size = 1
     return config
 
 
@@ -294,3 +303,176 @@ class TestDiffusionWorkerWakeUp:
         mock_buffer2.data.copy_.assert_not_called()
 
         assert result is True
+
+
+class TestDiffusionWorkerRuntimeV2:
+    """Test runtime_v2 routing in DiffusionWorker."""
+
+    def test_execute_model_uses_runtime_v2_when_enabled(self, mocker: MockerFixture, mock_gpu_worker):
+        req = mocker.Mock()
+        req.prompts = [{"prompt": "cat"}]
+
+        mock_gpu_worker.od_config.runtime_v2_denoise_chunk_size = 2
+        mock_runtime_v2_runner = mocker.Mock()
+        expected_output = mocker.Mock()
+        mock_runtime_v2_runner.submit.return_value = "req-id"
+        mock_runtime_v2_runner.wait.return_value = expected_output
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+        mock_gpu_worker.model_runner.execute_model = mocker.Mock()
+
+        result = mock_gpu_worker.execute_model(req, mock_gpu_worker.od_config)
+
+        mock_runtime_v2_runner.submit.assert_called_once_with(req, denoise_chunk_size=2)
+        mock_runtime_v2_runner.wait.assert_called_once_with("req-id", timeout_s=None)
+        mock_gpu_worker.model_runner.execute_model.assert_not_called()
+        assert result == expected_output
+
+    def test_execute_model_rejects_multi_prompt_requests(self, mocker: MockerFixture, mock_gpu_worker):
+        req = mocker.Mock()
+        req.prompts = ["p0", "p1"]
+
+        mock_runtime_v2_runner = mocker.Mock()
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+
+        with pytest.raises(ValueError, match="single-prompt"):
+            mock_gpu_worker.execute_model(req, mock_gpu_worker.od_config)
+
+        mock_runtime_v2_runner.submit.assert_not_called()
+
+    def test_shutdown_closes_runtime_v2_runner(self, mocker: MockerFixture, mock_gpu_worker):
+        mock_runtime_v2_runner = mocker.Mock()
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+        mock_destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+
+        mock_gpu_worker.shutdown()
+
+        mock_runtime_v2_runner.close.assert_called_once_with()
+        mock_destroy.assert_called_once_with()
+
+    def test_runtime_v2_submit_delegation(self, mocker: MockerFixture, mock_gpu_worker):
+        req = mocker.Mock()
+        req.prompts = [{"prompt": "cat"}]
+        mock_runtime_v2_runner = mocker.Mock()
+        mock_runtime_v2_runner.submit.return_value = "req-id"
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+        mock_gpu_worker.od_config.runtime_v2_denoise_chunk_size = 3
+
+        request_id = mock_gpu_worker.runtime_v2_submit(req)
+
+        mock_runtime_v2_runner.submit.assert_called_once_with(req, denoise_chunk_size=3)
+        assert request_id == "req-id"
+
+    def test_runtime_v2_wait_delegation(self, mocker: MockerFixture, mock_gpu_worker):
+        mock_runtime_v2_runner = mocker.Mock()
+        expected_output = mocker.Mock()
+        mock_runtime_v2_runner.wait.return_value = expected_output
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+
+        output = mock_gpu_worker.runtime_v2_wait("req-id", timeout_s=12.0)
+
+        mock_runtime_v2_runner.wait.assert_called_once_with("req-id", timeout_s=12.0)
+        assert output == expected_output
+
+    def test_runtime_v2_poll_once_delegation(self, mocker: MockerFixture, mock_gpu_worker):
+        mock_runtime_v2_runner = mocker.Mock()
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+
+        mock_gpu_worker.runtime_v2_poll_once(timeout_s=0.02)
+
+        mock_runtime_v2_runner.poll_once.assert_called_once_with(timeout_s=0.02)
+
+    def test_runtime_v2_get_request_status_delegation(self, mocker: MockerFixture, mock_gpu_worker):
+        mock_runtime_v2_runner = mocker.Mock()
+        expected = ("pending", None)
+        mock_runtime_v2_runner.get_request_status.return_value = expected
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+
+        status = mock_gpu_worker.runtime_v2_get_request_status("req-id")
+
+        mock_runtime_v2_runner.get_request_status.assert_called_once_with("req-id")
+        assert status == expected
+
+    def test_runtime_v2_release_request_delegation(self, mocker: MockerFixture, mock_gpu_worker):
+        mock_runtime_v2_runner = mocker.Mock()
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+
+        mock_gpu_worker.runtime_v2_release_request("req-id")
+
+        mock_runtime_v2_runner.release_request.assert_called_once_with("req-id")
+
+    def test_runtime_v2_entrypoint_submit_activates_lora(self, mocker: MockerFixture, mock_gpu_worker):
+        req = mocker.Mock()
+        req.prompts = [{"prompt": "cat"}]
+        req.sampling_params = mocker.Mock()
+        req.sampling_params.lora_request = None
+        req.sampling_params.lora_scale = 0.9
+
+        mock_runtime_v2_runner = mocker.Mock()
+        mock_runtime_v2_runner.submit.return_value = "req-id"
+        mock_gpu_worker.runtime_v2_runner = mock_runtime_v2_runner
+        mock_gpu_worker.lora_manager = mocker.Mock()
+
+        request_id = mock_gpu_worker.runtime_v2_entrypoint_submit(req, denoise_chunk_size=4)
+
+        mock_gpu_worker.lora_manager.set_active_adapter.assert_called_once_with(None, 0.9)
+        mock_runtime_v2_runner.submit.assert_called_once_with(req, denoise_chunk_size=4)
+        assert request_id == "req-id"
+
+    def test_supports_runtime_v2_uses_registry(self, mock_gpu_worker):
+        mock_gpu_worker.od_config.model_class_name = "QwenImagePipeline"
+        assert mock_gpu_worker._supports_runtime_v2() is True
+        mock_gpu_worker.od_config.model_class_name = "FluxPipeline"
+        assert mock_gpu_worker._supports_runtime_v2() is False
+
+    def test_maybe_init_runtime_v2_runner_fails_for_unsupported_model(
+        self, mocker: MockerFixture, mock_gpu_worker
+    ):
+        mock_gpu_worker.od_config.enable_runtime_v2 = True
+        mock_gpu_worker.od_config.model_class_name = "FluxPipeline"
+
+        with pytest.raises(ValueError, match="does not support"):
+            mock_gpu_worker._maybe_init_runtime_v2_runner()
+
+
+class TestWorkerProcRuntimeV2Cleanup:
+    """Test runtime_v2 entrypoint cleanup in WorkerProc."""
+
+    @staticmethod
+    def _make_proc(mocker: MockerFixture, pending_ids: list[str]) -> WorkerProc:
+        proc = WorkerProc.__new__(WorkerProc)
+        proc.worker = mocker.Mock()
+        proc.result_mq = None
+        proc._pending_runtime_v2 = {
+            request_id: _PendingRuntimeV2Submission(
+                scheduler_req_id=f"scheduler-{idx}",
+                should_reply=False,
+            )
+            for idx, request_id in enumerate(pending_ids)
+        }
+        return proc
+
+    @pytest.mark.parametrize("status,payload", [("finished", "done"), ("failed", "boom")])
+    def test_drain_runtime_v2_completions_releases_terminal_request(
+        self,
+        mocker: MockerFixture,
+        status: str,
+        payload: object,
+    ) -> None:
+        proc = self._make_proc(mocker, ["runtime-1"])
+        proc.worker.runtime_v2_get_request_status.return_value = (status, payload)
+
+        proc._drain_runtime_v2_completions()
+
+        proc.worker.runtime_v2_release_request.assert_called_once_with("runtime-1")
+        assert proc._pending_runtime_v2 == {}
+
+    def test_fail_all_pending_runtime_v2_releases_each_request(self, mocker: MockerFixture) -> None:
+        proc = self._make_proc(mocker, ["runtime-1", "runtime-2"])
+
+        proc._fail_all_pending_runtime_v2(reason="worker shutdown")
+
+        proc.worker.runtime_v2_release_request.assert_has_calls(
+            [call("runtime-1"), call("runtime-2")],
+            any_order=True,
+        )
+        assert proc._pending_runtime_v2 == {}

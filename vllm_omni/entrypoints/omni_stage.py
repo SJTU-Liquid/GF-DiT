@@ -701,7 +701,14 @@ class OmniStage:
             Result dictionary if available, None otherwise. Result contains
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
         """
-        assert self._out_q is not None
+        if self._out_q is None:
+            # Worker was stopped (e.g. by a prior get_nowait exception, which
+            # calls stop_stage_worker() and clears _out_q). Returning None here
+            # lets AsyncOmni's output_handler keep polling other stages instead
+            # of crashing the whole orchestrator on a single dead stage; any
+            # in-flight requests bound to this stage will fail via the
+            # client-side timeout.
+            return None
         try:
             return self._out_q.get_nowait()
         except queue.Empty:
@@ -1354,6 +1361,15 @@ async def _stage_worker_async(
             _diffusion_kwargs = {k: v for k, v in engine_args.items() if k not in {"od_config", "model"}}
             if cfg_kv_collect_func is not None:
                 _diffusion_kwargs["cfg_kv_collect_func"] = cfg_kv_collect_func
+            _diffusion_kwargs["runtime_v2_worker_mode"] = bool(od_config.get("enable_runtime_v2", False))
+            if _diffusion_kwargs["runtime_v2_worker_mode"]:
+                _diffusion_kwargs["runtime_v2_direct_result_queue"] = out_q
+                if isinstance(out_q, ZmqQueue):
+                    _diffusion_kwargs["runtime_v2_direct_result_zmq_endpoint"] = out_q.endpoint
+                _diffusion_kwargs["runtime_v2_direct_result_stage_id"] = stage_id
+                _diffusion_kwargs["runtime_v2_direct_result_shm_threshold_bytes"] = shm_threshold_bytes
+                _diffusion_kwargs["runtime_v2_direct_result_final_output"] = bool(final_output)
+                _diffusion_kwargs["runtime_v2_direct_result_final_output_type"] = final_output_type
             stage_engine = AsyncOmniDiffusion(
                 model=model,
                 od_config=od_config,
@@ -1453,13 +1469,17 @@ async def _stage_worker_async(
     except Exception as e:
         logger.warning("Failed to send stage ready signal: %s", e)
     generation_out_q = asyncio.Queue()
+    pending_diffusion_submissions: dict[str, tuple[str, float]] = {}
+    diffusion_direct_result_mode = bool(
+        stage_type == "diffusion" and getattr(stage_engine, "runtime_v2_direct_output_enabled", False)
+    )
 
     # Batch processing loop
     _rx_bytes_by_rid: dict[Any, int] = {}
     _rx_decode_ms_by_rid: dict[Any, float] = {}
     _in_flight_ms_by_rid: dict[Any, float] = {}
 
-    async def generation_single_request(task: dict[str, Any]):
+    async def _prepare_generation_input(task: dict[str, Any]) -> tuple[str, OmniPromptType, float]:
         _recv_dequeue_ts = _time.time()
         rid = task["request_id"]
         try:
@@ -1470,46 +1490,40 @@ async def _stage_worker_async(
                 _in_flight_ms_by_rid[rid] = 0.0
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
-        try:
-            ein, _rx_metrics = try_recv_via_connector(
-                task=task,
-                connectors=connectors,
-                stage_id=stage_id,
+        ein, _rx_metrics = try_recv_via_connector(
+            task=task,
+            connectors=connectors,
+            stage_id=stage_id,
+        )
+        ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
+
+        if ein is None or _rx_metrics is None:
+            raise RuntimeError(
+                f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                "Ensure connectors are configured for all incoming edges."
             )
-            # TODO: hack type annotation for now.
-            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
-            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
+        _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+        _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
-            if ein is None or _rx_metrics is None:
-                raise RuntimeError(
-                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                    "Ensure connectors are configured for all incoming edges."
-                )
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+        logger.debug("Received batch size=1, request_ids=%s", rid)
+        _gen_t0 = _time.time()
+        if isinstance(ein, Sequence) and not isinstance(ein, str):
+            ein = ein[0]
+        return rid, cast(OmniPromptType, ein), _gen_t0
 
-            logger.debug("Received batch size=1, request_ids=%s", rid)
-            _gen_t0 = _time.time()
-            if isinstance(ein, Sequence) and not isinstance(ein, str):
-                ein = ein[0]
-
-            if stage_type == "diffusion":
-                diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
-                # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
+    async def generation_single_request(task: dict[str, Any]):
+        rid = task["request_id"]
+        try:
+            rid, ein, _gen_t0 = await _prepare_generation_input(task)
+            ein = cast(PromptType, ein)
+            llm_sampling_params: SamplingParams = task["sampling_params"]
+            gen_output = None
+            async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
+                gen_output = res
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                _gen_t0 = _gen_t1
                 await generation_out_q.put((rid, gen_output, _gen_ms))
-            else:
-                ein = cast(PromptType, ein)
-                llm_sampling_params: SamplingParams = task["sampling_params"]
-                gen_output = None
-                async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
-                    gen_output = res
-                    _gen_t1 = _time.time()
-                    _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
-                    _gen_t0 = _gen_t1
-                    await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
             out_q.put(
@@ -1520,6 +1534,91 @@ async def _stage_worker_async(
                 }
             )
 
+    async def _submit_diffusion_request(task: dict[str, Any]) -> None:
+        rid = task["request_id"]
+        try:
+            rid, ein, _gen_t0 = await _prepare_generation_input(task)
+            diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
+            diffusion_engine = cast(AsyncOmniDiffusion, stage_engine)
+            result_meta = {
+                "start_ts": _gen_t0,
+                "rx_decode_time_ms": float(_rx_decode_ms_by_rid.get(rid, 0.0)),
+                "rx_transfer_bytes": int(_rx_bytes_by_rid.get(rid, 0)),
+                "rx_in_flight_time_ms": float(_in_flight_ms_by_rid.get(rid, 0.0)),
+                "batch_id": 0,
+                "batch_size": 1,
+            }
+            submitted_request_id = await diffusion_engine.submit(
+                ein,
+                diffusion_sampling_params,
+                rid,
+                runtime_v2_result_meta=result_meta if diffusion_direct_result_mode else None,
+            )
+            if not diffusion_direct_result_mode:
+                pending_diffusion_submissions[submitted_request_id] = (rid, _gen_t0)
+            else:
+                _rx_bytes_by_rid.pop(rid, None)
+                _rx_decode_ms_by_rid.pop(rid, None)
+                _in_flight_ms_by_rid.pop(rid, None)
+            logger.info(
+                "[Stage-%s] diffusion submit accepted: request_id=%s pending=%d direct_mode=%s",
+                stage_id,
+                submitted_request_id,
+                len(pending_diffusion_submissions),
+                diffusion_direct_result_mode,
+            )
+        except Exception as e:
+            logger.exception("Failed on request %s: %s", rid, e)
+            out_q.put(
+                {
+                    "request_id": rid,
+                    "stage_id": stage_id,
+                    "error": str(e),
+                }
+            )
+
+    async def _poll_diffusion_completions(max_collect: int = 32) -> None:
+        if diffusion_direct_result_mode:
+            return
+        if stage_type != "diffusion" or not pending_diffusion_submissions:
+            return
+
+        diffusion_engine = cast(AsyncOmniDiffusion, stage_engine)
+        for request_id in list(pending_diffusion_submissions.keys())[:max_collect]:
+            state = pending_diffusion_submissions.get(request_id)
+            if state is None:
+                continue
+            output_request_id, start_ts = state
+            try:
+                gen_output = await diffusion_engine.try_collect(request_id, timeout_s=0.0)
+            except KeyError:
+                pending_diffusion_submissions.pop(request_id, None)
+                continue
+            except Exception as e:
+                pending_diffusion_submissions.pop(request_id, None)
+                logger.exception("Failed to collect request %s: %s", output_request_id, e)
+                out_q.put(
+                    {
+                        "request_id": output_request_id,
+                        "stage_id": stage_id,
+                        "error": str(e),
+                    }
+                )
+                continue
+
+            if gen_output is None:
+                continue
+
+            pending_diffusion_submissions.pop(request_id, None)
+            _gen_ms = (_time.time() - start_ts) * 1000.0
+            await generation_out_q.put((output_request_id, gen_output, _gen_ms))
+            logger.info(
+                "[Stage-%s] diffusion collect completed: request_id=%s pending=%d",
+                stage_id,
+                request_id,
+                len(pending_diffusion_submissions),
+            )
+
     _batch_gen_t0 = _time.time()
     while True:
         try:
@@ -1527,10 +1626,22 @@ async def _stage_worker_async(
             task_type = task.get("type", OmniStageTaskType.GENERATE)
             if task_type == OmniStageTaskType.SHUTDOWN:
                 logger.debug("Received shutdown signal")
+                if stage_type == "diffusion" and pending_diffusion_submissions:
+                    pending_request_ids = list(pending_diffusion_submissions.keys())
+                    try:
+                        await cast(AsyncOmniDiffusion, stage_engine).abort(pending_request_ids)
+                    except Exception as exc:
+                        logger.warning(
+                            "[Stage-%s] abort pending diffusion requests failed: %s",
+                            stage_id,
+                            exc,
+                        )
+                    pending_diffusion_submissions.clear()
                 stage_engine.shutdown()
                 break
             elif task_type == OmniStageTaskType.ABORT:
                 rid = task["request_id"]
+                pending_diffusion_submissions.pop(rid, None)
                 asyncio.create_task(stage_engine.abort(rid))
             elif is_profiler_task(task_type):
                 profiler_data = await handle_profiler_task_async(task_type)
@@ -1585,11 +1696,17 @@ async def _stage_worker_async(
                             "error": str(e),
                         }
                     )
+            elif stage_type == "diffusion":
+                await _submit_diffusion_request(task)
             else:
                 asyncio.create_task(generation_single_request(task))
 
         except queue.Empty:
             await asyncio.sleep(0.001)
+
+        if stage_type == "diffusion":
+            await _poll_diffusion_completions(max_collect=32)
+
         batch_request_outputs: list[Any] = []
         batch_request_ids: list[Any] = []
         _gen_ms_list = []
@@ -1668,6 +1785,9 @@ async def _stage_worker_async(
                     }
                 )
             logger.debug("Enqueued result for request %s to downstream", rid)
+            _rx_bytes_by_rid.pop(rid, None)
+            _rx_decode_ms_by_rid.pop(rid, None)
+            _in_flight_ms_by_rid.pop(rid, None)
     if log_stats_task is not None:
         log_stats_task.cancel()
     logger.info("Stage worker exiting")

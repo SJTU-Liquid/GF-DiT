@@ -8,6 +8,7 @@ mirrors the OpenAI Images API shape, with vllm-omni extensions for diffusion
 video models (e.g., Wan2.2).
 """
 
+import json
 import mimetypes
 import time
 import uuid
@@ -15,7 +16,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 
@@ -160,6 +161,40 @@ class VideoGenerationRequest(BaseModel):
             "scale|lora_scale, int_id|lora_int_id)."
         ),
     )
+
+    # Generic pass-through to OmniDiffusionSamplingParams.extra_args. Used by
+    # runtime_v2 EDF/best-fit policies to receive per-request priority,
+    # deadline, arrival, request_class metadata. Multipart-form clients can
+    # send a JSON-encoded string here; the validator parses it back.
+    extra_args: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Pass-through metadata copied into OmniDiffusionSamplingParams.extra_args. "
+            "Recognized runtime_v2 keys: runtime_v2_priority, runtime_v2_deadline_ms, "
+            "runtime_v2_arrival_ms, runtime_v2_request_class. Multipart clients may "
+            "submit a JSON string."
+        ),
+    )
+
+    @field_validator("extra_args", mode="before")
+    @classmethod
+    def _parse_extra_args(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"extra_args must be a dict or a JSON-encoded dict, got invalid JSON: {exc}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"extra_args JSON must decode to a dict, got {type(parsed).__name__}"
+                )
+            return parsed
+        return value
 
     def resolve_video_params(self) -> VideoParams:
         vp = VideoParams(width=self.width, height=self.height, fps=self.fps, num_frames=self.num_frames)

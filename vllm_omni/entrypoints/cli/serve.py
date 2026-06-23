@@ -209,6 +209,174 @@ class OmniServeCommand(CLISubcommand):
             help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
         )
         omni_config_group.add_argument(
+            "--enable-runtime-v2",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Enable diffusion runtime_v2 task-graph scheduler for models with a registered adapter.",
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-denoise-chunk-size",
+            type=int,
+            default=argparse.SUPPRESS,
+            help="Denoise step chunk size for runtime_v2 scheduling (default: 1).",
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-postprocess-workers-per-gpu",
+            type=int,
+            default=None,
+            help=(
+                "Number of postprocess+encode subprocesses to spawn per GPU worker "
+                "for runtime_v2 (default: 2 when unset). This subprocess pool runs "
+                "CPU postprocessing and video MP4 encoding off the API server event "
+                "loop. Left unset (None) so a per-stage YAML value is not clobbered "
+                "by the parser default; pass the flag to override YAML."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-scheduler-policy",
+            type=str,
+            default=argparse.SUPPRESS,
+            choices=(
+                "fcfs", "srtf", "disaggregate", "dynamic_step_fcfs",
+                "edf_greedy", "edf_best_fit", "wave_stress",
+            ),
+            help=(
+                "Scheduler policy for runtime_v2 (default: fcfs). 'disaggregate' enables "
+                "static two-group stage placement (text_encode/vae_decode/finalize on the aux "
+                "group, dit_prepare/timestep_prepare/dit_step_chunk on the dit group) with "
+                "explicit RESHARD tasks at the encode->dit and dit->vae boundaries. "
+                "'dynamic_step_fcfs' additionally allows dit_step_chunk tasks to follow "
+                "--runtime-v2-dit-step-schedule; disaggregate policies require "
+                "--runtime-v2-disaggregate-aux-group-id and --runtime-v2-disaggregate-dit-group-id. "
+                "'edf_greedy' uses EDF ordering with greedy free-rank SP placement; "
+                "'edf_best_fit' picks the smallest SP per request that still meets its "
+                "deadline (estimated via --runtime-v2-cost-model-dir) and redistributes "
+                "leftover ranks to the most-urgent placed request. 'wave_stress' is a "
+                "deterministic stress test: first N requests run normally, then batches "
+                "of 4 are collected and dispatched round-robin across dynamically-built "
+                "GFC subgroups (G01/G12/GFULL + a same-request pingpong rotation) to "
+                "exercise dynamic group construction, per-task SP switching, and dispatch-"
+                "time reshard. The EDF policies and 'wave_stress' require "
+                "--runtime-v2-collective-backend=gfc."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-collective-backend",
+            type=str,
+            default=argparse.SUPPRESS,
+            choices=("torch", "gfc"),
+            help=(
+                "Collective backend for runtime_v2 SP all-gather/all-to-all. "
+                "Default 'torch' uses torch.distributed subgroups. 'gfc' uses "
+                "the optional Group-Free Collective package for subgroup-free "
+                "SP collectives; P2P paths remain torch global-rank P2P."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-gfc-max-collective-mb",
+            type=int,
+            default=argparse.SUPPRESS,
+            help=(
+                "GFC max single-collective payload in MiB. Pins ~max MiB "
+                "of symmetric memory per rank. Set to the worst-case SP "
+                "all-gather/all-to-all payload bytes you expect."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-wave-stress-warmup-reqs",
+            type=int,
+            default=argparse.SUPPRESS,
+            help=(
+                "wave_stress: how many leading requests are passed through unchanged "
+                "before wave collection begins (default 5). Must cover vllm-omni's own "
+                "synchronous startup warmup (1) plus any benchmark --warmup-requests, "
+                "otherwise the startup warmup gets stuck in the collect pool and the "
+                "engine never reports ready."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-wave-stress-wave-size",
+            type=int,
+            default=argparse.SUPPRESS,
+            help=(
+                "wave_stress: number of requests per wave (default 4). "
+                "Must be in [2, 4]: roles are assigned by arrival order as "
+                "cross_g01 / cross_g12 / cross_full / pingpong."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-disaggregate-aux-group-id",
+            type=str,
+            default=None,
+            help=(
+                "Execution group id that runs text_encode / vae_decode / finalize when "
+                "--runtime-v2-scheduler-policy=disaggregate."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-disaggregate-dit-group-id",
+            type=str,
+            default=None,
+            help=(
+                "Execution group id that runs dit_prepare / timestep_prepare / dit_step_chunk when "
+                "--runtime-v2-scheduler-policy=disaggregate."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-group-sizes",
+            type=str,
+            default=None,
+            help=(
+                "Runtime_v2 execution group size shorthand. Comma-separated integers, "
+                "for example: 4,2,1,1 or 1,1,1,1,1,1,1,1."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-groups-json",
+            type=str,
+            default=None,
+            help=(
+                "Runtime_v2 explicit group configuration JSON. "
+                "Example: "
+                '\'[{"size":4,"tp":4,"ulysses_degree":1,"ring_degree":1,"cfg":1},'
+                '{"size":2,"tp":2,"ulysses_degree":1,"ring_degree":1,"cfg":1},'
+                '{"size":1,"tp":1,"ulysses_degree":1,"ring_degree":1,"cfg":1},'
+                '{"size":1,"tp":1,"ulysses_degree":1,"ring_degree":1,"cfg":1}]\''
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-dit-step-schedule",
+            type=str,
+            default=None,
+            help=(
+                "Runtime_v2 DiT step placement schedule JSON for dynamic_step_fcfs. "
+                "Example: "
+                '\'[{"start":0,"end":10,"group_id":"g_sp2"},'
+                '{"start":10,"end":null,"group_id":"g_sp4"}]\''
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-edf-greedy-sp-sizes",
+            type=str,
+            default=None,
+            help=(
+                "Comma-separated SP sizes allowed for runtime_v2 edf_greedy / edf_best_fit "
+                "dynamic DiT groups. Default is powers of two up to num_gpus plus num_gpus."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--runtime-v2-cost-model-dir",
+            type=str,
+            default=None,
+            help=(
+                "Path to a directory of cost-model JSON files "
+                "(one per (tp, sp, ulysses, ring, cfg)) used by edf_best_fit to "
+                "predict end-to-end finish time per SP. Without it the policy "
+                "degrades to largest-fit. Produced by "
+                "scripts/profile-stages-fullrange.sh or the synthetic generator."
+            ),
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",

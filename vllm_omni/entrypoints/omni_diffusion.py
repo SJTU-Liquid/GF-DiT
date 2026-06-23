@@ -4,6 +4,8 @@
 import time
 import uuid
 from collections.abc import Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import threading
 
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
@@ -15,6 +17,12 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+class _PendingSubmit:
+    def __init__(self, future: Future[str]) -> None:
+        self.future = future
+        self.engine_submission_id: str | None = None
 
 
 class OmniDiffusion:
@@ -110,14 +118,20 @@ class OmniDiffusion:
             od_config.cfg_kv_collect_func = cfg_kv_collect_func
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
+        self._submit_executor = ThreadPoolExecutor(max_workers=1)
+        self._pending_submit_lock = threading.Lock()
+        self._pending_submissions: dict[str, _PendingSubmit] = {}
 
     def generate(
         self,
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
-        request_ids: list[str] = [],
+        request_ids: list[str] | None = None,
     ) -> list[OmniRequestOutput]:
         _t0 = time.perf_counter()
+        # Copy into a fresh list: a mutable default ([]) shared across calls would
+        # accumulate request_ids and route results to the wrong request.
+        request_ids = list(request_ids) if request_ids else []
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
         else:
@@ -133,10 +147,62 @@ class OmniDiffusion:
         logger.info("OmniDiffusion.generate total: %.2f ms", _t_ms)
         return result
 
+    def submit(
+        self,
+        prompts: OmniPromptType | Sequence[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        request_ids: list[str] | None = None,
+    ) -> str:
+        request_ids = list(request_ids) if request_ids else []
+        if isinstance(prompts, (str, dict)):
+            prompts = [prompts]
+        else:
+            prompts = list(prompts)
+
+        if len(request_ids) < len(prompts):
+            request_ids.extend(f"{i + len(request_ids)}_{uuid.uuid4()}" for i in range(len(prompts) - len(request_ids)))
+
+        request = OmniDiffusionRequest(prompts, sampling_params, request_ids)
+        frontend_submission_id = f"frontend-{uuid.uuid4().hex}"
+        submit_future = self._submit_executor.submit(self.engine.submit, request)
+        with self._pending_submit_lock:
+            self._pending_submissions[frontend_submission_id] = _PendingSubmit(submit_future)
+        return frontend_submission_id
+
+    def collect(self, submission_id: str, timeout_s: float | None = None) -> list[OmniRequestOutput]:
+        t0 = time.monotonic()
+        with self._pending_submit_lock:
+            pending = self._pending_submissions.get(submission_id)
+        if pending is None:
+            raise KeyError(f"Unknown submission_id: {submission_id}")
+
+        try:
+            if pending.engine_submission_id is None:
+                pending.engine_submission_id = pending.future.result(timeout=timeout_s)
+        except FutureTimeoutError as exc:
+            raise TimeoutError(f"Timed out waiting for submit to complete: {submission_id}") from exc
+        except Exception:
+            with self._pending_submit_lock:
+                self._pending_submissions.pop(submission_id, None)
+            raise
+
+        remaining_timeout = None
+        if timeout_s is not None:
+            elapsed = time.monotonic() - t0
+            remaining_timeout = max(0.0, timeout_s - elapsed)
+
+        outputs = self.engine.collect(pending.engine_submission_id, timeout_s=remaining_timeout)
+        with self._pending_submit_lock:
+            self._pending_submissions.pop(submission_id, None)
+        return outputs
+
     def _run_engine(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         return self.engine.step(request)
 
     def close(self) -> None:
+        with self._pending_submit_lock:
+            self._pending_submissions.clear()
+        self._submit_executor.shutdown(wait=False, cancel_futures=True)
         self.engine.close()
 
     def __del__(self):  # pragma: no cover - best effort cleanup

@@ -33,12 +33,12 @@ class OmniDiffusionRequest:
             (not isinstance(p, str) and p.get("negative_prompt")) for p in self.prompts
         ):
             self.sampling_params.do_classifier_free_guidance = True
-        if self.sampling_params.guidance_scale_2 is None:
-            self.sampling_params.guidance_scale_2 = self.sampling_params.guidance_scale
 
         # The dataclass default value is 0 (false-like), used to detect whether user explicitly provides this value
         # After this check is done, reset this value to old default 1
         if self.sampling_params.guidance_scale:
             self.sampling_params.guidance_scale_provided = True
+            if self.sampling_params.guidance_scale_2 is None:
+                self.sampling_params.guidance_scale_2 = self.sampling_params.guidance_scale
         else:
             self.sampling_params.guidance_scale = 1.0

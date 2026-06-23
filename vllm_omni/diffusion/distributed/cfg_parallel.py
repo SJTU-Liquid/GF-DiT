@@ -76,9 +76,49 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 else:
                     return None
             else:
-                # Sequential CFG: compute both positive and negative
+                # Sequential CFG: compute both positive and negative.
+                #
+                # DIAGNOSTIC ONLY: VLLM_OMNI_CFG_TIME=1 enables per-forward
+                # timing via CUDA events. The trailing _ev_end.synchronize()
+                # is a host block (~one forward of latency) — DO NOT leave
+                # this env var set in benchmark or production environments.
+                # It only exists for ad-hoc CFG-forward profiling.
+                import os as _os
+                _time_cfg = _os.environ.get("VLLM_OMNI_CFG_TIME") == "1"
+                if _time_cfg:
+                    import torch as _torch
+                    if not getattr(CFGParallelMixin, "_cfg_time_warned", False):
+                        try:
+                            from vllm.logger import init_logger as _il
+                            _il(__name__).warning(
+                                "VLLM_OMNI_CFG_TIME=1 is set: per-CFG-forward "
+                                "host sync is active. This is a diagnostic "
+                                "tool and will hurt throughput; unset for "
+                                "benchmarks and production."
+                            )
+                        except Exception:
+                            pass
+                        CFGParallelMixin._cfg_time_warned = True
+                    _ev_start = _torch.cuda.Event(enable_timing=True)
+                    _ev_mid = _torch.cuda.Event(enable_timing=True)
+                    _ev_end = _torch.cuda.Event(enable_timing=True)
+                    _ev_start.record()
                 positive_noise_pred = self.predict_noise(**positive_kwargs)
+                if _time_cfg:
+                    _ev_mid.record()
                 negative_noise_pred = self.predict_noise(**negative_kwargs)
+                if _time_cfg:
+                    _ev_end.record()
+                    _ev_end.synchronize()  # forces host wait — diagnostic only
+                    try:
+                        from vllm.logger import init_logger as _il
+                        _il(__name__).info(
+                            "cfg_seq forward timing: positive_ms=%.1f negative_ms=%.1f",
+                            _ev_start.elapsed_time(_ev_mid),
+                            _ev_mid.elapsed_time(_ev_end),
+                        )
+                    except Exception:
+                        pass
 
                 # Slice output for image editing pipelines
                 if output_slice is not None:
