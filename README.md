@@ -1,97 +1,182 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png">
-    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/logos/vllm-omni-logo.png" width=55%>
-  </picture>
-</p>
-<h3 align="center">
-Easy, fast, and cheap omni-modality model serving for everyone
-</h3>
+<div align="center">
 
-<p align="center">
-| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1XJWgv79lORl8rbaVvp2d5Sqs6ZEBgAgj/edit?slide=id.p1#slide=id.p1"><b>Slides</b></a> |
-</p>
+# GF-DiT: Scheduling Parallelism for Diffusion Transformer Serving
 
+**A policy-programmable runtime for *elastic* Diffusion-Transformer serving — built on [vLLM-Omni](https://github.com/vllm-project/vllm-omni).**
+
+[**Paper** (arXiv:2606.13501)](https://arxiv.org/abs/2606.13501) ·
+[**Group-Free Collectives** (`gfc`)](https://github.com/SJTU-Liquid/group-free-collectives) ·
+[**vLLM-Omni**](https://github.com/vllm-project/vllm-omni)
+
+</div>
 
 ---
 
-*Latest News* 🔥
+> This repository is the research artifact for **GF-DiT**. GF-DiT is implemented as a
+> task-centric elastic runtime (`runtime_v2`) inside a fork of vLLM-Omni, plus a
+> group-free collective backend. It is **opt-in** — with `--enable-runtime-v2` omitted the
+> server behaves exactly like stock vLLM-Omni.
 
-- [2026/03] Check out our first public [project deepdive](https://youtu.be/sgwNfsNnR9I) at the vLLM Hong Kong Meetup!
-- [2026/03] **[vllm-omni-skills](https://github.com/hsliuustc0106/vllm-omni-skills)** is a community-driven collection of AI assistant skills that help developers work with vLLM-Omni more effectively. These skills can be used with popular agentic AI coding assistants like **Cursor IDE**, **Claude**, **Codex**, and more.
-- [2026/02] We released [0.16.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.16.0) - A major alignment + capability release that rebases onto **upstream vLLM v0.16.0** and significantly expands performance, distributed execution, and production readiness across **Qwen3-Omni / Qwen3-TTS**, **Bagel**, **MiMo-Audio**, **GLM-Image** and the **Diffusion (DiT) image/video stack**—while also improving platform coverage (CUDA / ROCm / NPU / XPU), CI quality, and documentation.
-- [2026/02] We released [0.14.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.14.0) - This is the first **stable release** of vLLM-Omni that expands Omni’s diffusion / image-video generation and audio / TTS stack, improves distributed execution and memory efficiency, and broadens platform/backend coverage (GPU/ROCm/NPU/XPU). It also brings meaningful upgrades to serving APIs, profiling & benchmarking, and overall stability. Please check our latest [paper](https://arxiv.org/abs/2602.02204) for architecture design and performance results.
-- [2026/01] We released [0.12.0rc1](https://github.com/vllm-project/vllm-omni/releases/tag/v0.12.0rc1) - a major RC milestone focused on maturing the diffusion stack, strengthening OpenAI-compatible serving, expanding omni-model coverage, and improving stability across platforms (GPU/NPU/ROCm).
-- [2025/11] vLLM community officially released [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) in order to support omni-modality models serving.
+## What is GF-DiT
 
----
+Existing DiT servers pin a request's parallel configuration (TP/SP/CFG degrees, rank set)
+at admission and hold it fixed for the request's entire denoising trajectory. But DiT
+workloads are heterogeneous across requests, across the stages of one request, and across
+changing system load — so any single static choice wastes GPUs and degrades service
+quality.
 
-## About
+GF-DiT treats **GPU parallelism as a first-class schedulable resource** and adapts the
+parallelism of *running* requests to workload demand and service objectives, via three
+ideas:
 
-[vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni is a framework that extends its support for omni-modality model inference and serving:
+- **An asynchronous execution abstraction** that decomposes each request into independently
+  schedulable *trajectory tasks* and enables online GPU reallocation.
+- **Group-free collectives (GFC)** — a lightweight communication layer that forms and
+  reconfigures arbitrary execution groups online at microsecond cost (no
+  `new_group`/`destroy_process_group`).
+- **Policy-programmable scheduling** — pluggable policies decide task order and execution
+  layout per objective (throughput, latency, SLO).
 
-- **Omni-modality**: Text, image, video, and audio data processing
-- **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
-- **Heterogeneous outputs**: from traditional text generation to multimodal outputs
+Across Qwen-Image / WAN on H20 / H100 / A100, GF-DiT delivers up to **6.01× throughput**,
+up to **95%** lower mean latency, and up to **90%** fewer SLO violations, while cutting
+communication-group setup from **778 ms to ~60 µs**. See the
+[paper](https://arxiv.org/abs/2606.13501) for the full methodology and results.
 
-<p align="center">
-  <picture>
-    <img alt="vllm-omni" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/docs/source/architecture/omni-modality-model-architecture.png" width=55%>
-  </picture>
-</p>
+## Why elastic parallelism
 
-vLLM-Omni is fast with:
+No single static parallel degree is right for all requests — the optimal sequence-parallel
+(SP) degree flips with sequence length. Per-step DiT-chunk latency (ms), Qwen-Image
+(20B DiT), H20-native cost model (r² ≈ 1.0):
 
-- State-of-the-art AR support by leveraging efficient KV cache management from vLLM
-- Pipelined stage execution overlapping for high throughput performance
-- Fully disaggregation based on OmniConnector and dynamic resource allocation across stages
+| class (latent)            | SP1     | SP2 | SP4     | optimal                    |
+| ------------------------- | ------: | --: | ------: | -------------------------- |
+| **S** — 512²  (1024 tok)  | **155** | 161 |     172 | SP1 — wider is *slower*    |
+| **M** — 1024² (4096 tok)  |     605 | 350 | **207** | SP4 (~3×)                  |
+| **L** — 1536² (9216 tok)  |    1557 | 880 | **464** | SP4 (~3.4×)                |
 
-vLLM-Omni is flexible and easy to use with:
+Sweet spots also differ *across stages* (text-encode / DiT / VAE decode) and *across time*
+(load, queue depth, free-rank set). One admission-time decision is therefore Pareto-bad for
+part of every workload — which is exactly what GF-DiT removes.
 
-- Heterogeneous pipeline abstraction to manage complex model workflows
-- Seamless integration with popular Hugging Face models
-- Tensor, pipeline, data and expert parallelism support for distributed inference
-- Streaming outputs
-- OpenAI-compatible API server
+## How it works
 
-vLLM-Omni seamlessly supports most popular open-source models on HuggingFace, including:
+GF-DiT lives under `vllm_omni/diffusion/runtime_v2/` plus the group-free collective backend.
 
-- Omni-modality models (e.g. Qwen-Omni)
-- Multi-modality generation models (e.g. Qwen-Image)
+| Component               | What it does                                                                    | Code |
+| ----------------------- | ------------------------------------------------------------------------------ | ---- |
+| Task-graph scheduler    | Event-driven dispatch of trajectory tasks; per-request lifecycle               | `runtime_v2/scheduler.py`, `runtime_v2/runner.py` |
+| Elastic migration       | Layout-aware online artifact movement across execution groups (SP reshard)     | `runtime_v2/migration_engine.py`, `runtime_v2/data_plane.py` |
+| Group-free collectives  | µs-cost online group formation/reconfig (`all_gather` / `all2all` / `p2p`)      | `distributed/collective_runtime.py` + [`gfc`](https://github.com/SJTU-Liquid/group-free-collectives) |
+| Pluggable policies      | Choose task order + execution layout per objective                             | `runtime_v2/policies/` — FCFS, SRTF, SJF, EDF-greedy, EDF-best-fit, disaggregate, wave-stress |
+| Cost model + simulator  | Per-stage latency model for deadline-aware policies; offline what-if analysis  | `runtime_v2/cost_model.py`, `benchmarks/diffusion/` |
 
-## Getting Started
+## Quickstart
 
-Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn more.
+GF-DiT builds on vLLM-Omni. Install the base framework (see the upstream
+[installation guide](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)),
+then this fork:
 
-- [Installation](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)
-- [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
-- [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
+```bash
+# base framework + this fork
+pip install -e .
 
-## Contributing
+# (optional) group-free collectives — enables the elastic group-reconfig path
+pip install git+https://github.com/SJTU-Liquid/group-free-collectives.git
+```
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
+Serve a DiT model with the elastic runtime enabled:
+
+```bash
+vllm serve <your-dit-model> --omni \
+  --num-gpus 4 \
+  --enable-runtime-v2 \
+  --runtime-v2-scheduler-policy edf_best_fit \
+  --runtime-v2-collective-backend gfc \
+  --runtime-v2-gfc-max-collective-mb 1024
+```
+
+Without `gfc` installed, use the dependency-free PyTorch backend — the task-graph scheduler
+still runs, but without online group reconfiguration:
+
+```bash
+  --runtime-v2-collective-backend torch
+```
+
+vLLM-Omni exposes an OpenAI-compatible API; send a generation request (see the upstream
+[docs](https://vllm-omni.readthedocs.io/en/latest/) for the full schema and supported
+models):
+
+```bash
+curl http://localhost:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<your-dit-model>", "prompt": "a red panda on a skateboard"}'
+```
+
+Ready-made launch scripts live in `scripts/` — e.g. `serve-adaptive.sh`, `serve-elastic.sh`,
+`serve-edf-best.sh`, `serve-disaggragate.sh`, and the static baselines
+`serve-baseline-sp4.sh` / `serve-base.sh`.
+
+### Key flags
+
+| Flag                                 | Meaning |
+| ------------------------------------ | ------- |
+| `--enable-runtime-v2`                | Turn on the GF-DiT task-graph runtime (opt-in) |
+| `--runtime-v2-scheduler-policy`      | `fcfs` · `srtf` · `disaggregate` · `dynamic_step_fcfs` · `edf_greedy` · `edf_best_fit` · `wave_stress` |
+| `--runtime-v2-collective-backend`    | `torch` (default, no extra deps) or `gfc` (elastic group reconfig) |
+| `--runtime-v2-denoise-chunk-size`    | Denoise steps per schedulable task chunk |
+| `--runtime-v2-gfc-max-collective-mb` | GFC symmetric-memory budget per rank (MiB) |
+
+## Reproducing the paper results
+
+Entry points (see the [paper](https://arxiv.org/abs/2606.13501) for the full setup and the
+expected numbers):
+
+- **Cost-model profiling** — `scripts/profile-stages.sh` (per-host, per-stage latency grid).
+- **Serving benchmark** — `benchmarks/diffusion/diffusion_benchmark_serving.py`
+  (throughput / latency / SLO under load).
+- **Sim-vs-real grids** — `benchmarks/diffusion/gen_sim_vs_real_grid.py`.
+- **GFC vs NCCL group cost** — `benchmarks/distributed/gfc_group_cost.py` versus
+  `benchmarks/distributed/nccl_subgroup_cost.py` (the 778 ms → ~60 µs result).
+
+## Relationship to vLLM-Omni
+
+This repository is a fork of [vLLM-Omni](https://github.com/vllm-project/vllm-omni). GF-DiT
+is additive: it lives under `vllm_omni/diffusion/runtime_v2/` and the GFC collective
+backend, and is gated behind `--enable-runtime-v2`. Base installation, supported models, and
+the OpenAI-compatible server all follow upstream vLLM-Omni — see their
+[documentation](https://vllm-omni.readthedocs.io/en/latest/).
 
 ## Citation
 
-If you use vLLM-Omni for your research, please cite our [paper](https://arxiv.org/abs/2602.02204):
+If you use GF-DiT, please cite:
 
 ```bibtex
-@article{yin2026vllmomni,
-  title={vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models},
-  author={Peiqi Yin, Jiangyun Zhu, Han Gao, Chenguang Zheng, Yongxiang Huang, Taichang Zhou, Ruirui Yang, Weizhi Liu, Weiqing Chen, Canlin Guo, Didan Deng, Zifeng Mo, Cong Wang, James Cheng, Roger Wang, Hongsheng Liu},
-  journal={arXiv preprint arXiv:2602.02204},
-  year={2026}
+@misc{qiang2026gfditschedulingparallelismdiffusion,
+      title={GF-DiT: Scheduling Parallelism for Diffusion Transformer Serving}, 
+      author={Xinwei Qiang and Yifan Hu and Shixuan Sun and Jing Yang and Han Zhao and Chen Chen and Yu Feng and Jingwen Leng and Minyi Guo},
+      year={2026},
+      eprint={2606.13501},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2606.13501}, 
 }
 ```
 
-## Join the Community
-Feel free to ask questions, provide feedbacks and discuss with fellow users of vLLM-Omni in `#sig-omni` slack channel at [slack.vllm.ai](https://slack.vllm.ai) or vLLM user forum at [discuss.vllm.ai](https://discuss.vllm.ai).
+GF-DiT is built on vLLM-Omni; please also cite their work:
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=vllm-project/vllm-omni&type=date&legend=top-left)](https://www.star-history.com/#vllm-project/vllm-omni&type=date&legend=top-left)
+```bibtex
+@misc{yin2026vllmomnifullydisaggregatedserving,
+      title={vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models}, 
+      author={Peiqi Yin and Jiangyun Zhu and Han Gao and Chenguang Zheng and Yongxiang Huang and Taichang Zhou and Ruirui Yang and Weizhi Liu and Weiqing Chen and Canlin Guo and Didan Deng and Zifeng Mo and Cong Wang and James Cheng and Roger Wang and Hongsheng Liu},
+      year={2026},
+      eprint={2602.02204},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2602.02204}, 
+}
+```
 
 ## License
 
-Apache License 2.0, as found in the [LICENSE](./LICENSE) file.
+Apache License 2.0, as found in the [LICENSE](./LICENSE) file. GF-DiT inherits vLLM-Omni's
+license.
