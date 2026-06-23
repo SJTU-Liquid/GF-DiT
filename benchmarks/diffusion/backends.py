@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import mimetypes
 import os
@@ -8,6 +9,18 @@ from typing import Any
 
 import aiohttp
 from tqdm import tqdm
+
+
+def _is_video_debug_enabled() -> bool:
+    value = os.getenv("VLLM_OMNI_BENCH_VIDEO_DEBUG", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _video_debug(req: "RequestFuncInput", message: str) -> None:
+    if not _is_video_debug_enabled():
+        return
+    now = time.strftime("%H:%M:%S")
+    print(f"[bench-v1-videos][{now}][client_req={req.request_id}] {message}", flush=True)
 
 
 @dataclass
@@ -23,9 +36,12 @@ class RequestFuncInput:
     fps: int | None = None
     timestamp: float | None = None
     slo_ms: float | None = None
+    video_job_timeout_seconds: float | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
     image_paths: list[str] | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Optional class label (e.g. "S"/"M"/"L") carried through to per-class metrics.
+    request_class: str | None = None
 
 
 @dataclass
@@ -35,6 +51,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     response_body: dict[str, Any] = field(default_factory=dict)
+    stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
 
@@ -55,6 +72,7 @@ async def async_request_chat_completions(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
 ) -> RequestFuncOutput:
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
@@ -108,6 +126,18 @@ async def async_request_chat_completions(
                 output.success = True
                 if "peak_memory_mb" in resp_json:
                     output.peak_memory_mb = resp_json["peak_memory_mb"]
+                try:
+                    choices = resp_json.get("choices", [])
+                    if choices and isinstance(choices, list):
+                        msg = choices[0].get("message", {})
+                        if isinstance(msg, dict):
+                            content = msg.get("content", [])
+                            if content and isinstance(content, list) and len(content) > 0:
+                                first_item = content[0]
+                                if isinstance(first_item, dict):
+                                    output.stage_durations = first_item.get("stage_durations")
+                except (IndexError, TypeError, AttributeError):
+                    pass
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
@@ -166,8 +196,13 @@ async def async_request_openai_images(
         "Authorization": "Bearer EMPTY",
     }
 
+    # aiohttp default total timeout is 5min, but image SLO budgets (esp. heavy
+    # classes under queueing) can exceed 5min. Cap at 25min so the client does
+    # not fail requests still validly running -- they should count as SLO-miss
+    # if they finish past deadline, not as a transport failure.
+    timeout = aiohttp.ClientTimeout(total=1500)
     try:
-        async with session.post(input.api_url, json=payload, headers=headers) as response:
+        async with session.post(input.api_url, json=payload, headers=headers, timeout=timeout) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json
@@ -192,7 +227,176 @@ async def async_request_openai_images(
     return output
 
 
+async def async_request_v1_videos(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    files = dict(input.extra_body)
+    files.setdefault("user", input.request_id)
+    if input.prompt:
+        files.setdefault("prompt", input.prompt)
+    if input.width and input.height:
+        files.setdefault("height", input.height)
+        files.setdefault("width", input.width)
+    if input.num_frames:
+        files.setdefault("num_frames", input.num_frames)
+    if input.num_inference_steps:
+        files.setdefault("num_inference_steps", input.num_inference_steps)
+    if input.seed is not None:
+        files.setdefault("seed", input.seed)
+    if input.fps:
+        files.setdefault("fps", input.fps)
+
+    form = aiohttp.FormData()
+    for k, v in files.items():
+        form.add_field(k, str(v))
+
+    image_file = None
+    if input.image_paths and len(input.image_paths) > 0:
+        image_path = input.image_paths[0]
+        image_file = open(image_path, "rb")
+        form.add_field(
+            "input_reference",
+            image_file,
+            filename=os.path.basename(image_path),
+            content_type="application/octet-stream",
+        )
+
+    job_id = None
+    job_status = None
+    poll_json = {}
+    resp_json = {}
+
+    try:
+        # invoke a post request (POST /v1/videos)
+        async with session.post(input.api_url, data=form) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                job_id = resp_json.get("id")
+                job_status = resp_json.get("status")
+                if not job_id or not job_status:
+                    output.error = "API response missing job 'id' or 'status' field."
+                    output.success = False
+                    _video_debug(input, f"post_missing_fields body={resp_json}")
+                    return output
+                _video_debug(
+                    input,
+                    f"post_ok job_id={job_id} status={job_status} api_url={input.api_url}",
+                )
+            else:
+                body = await response.text()
+                output.error = f"HTTP {response.status}: {body}"
+                output.success = False
+                _video_debug(input, f"post_fail http={response.status} body={body}")
+                return output
+
+        # invoke a poll request (GET /v1/videos/{video_id})
+        poll_interval = 2.0  # Unit(s)
+        timeout_seconds = input.video_job_timeout_seconds or 3600.0
+        deadline = time.perf_counter() + timeout_seconds
+        job_url = f"{input.api_url}/{job_id}"
+        poll_count = 0
+
+        while job_status not in {"completed", "failed"}:
+            await asyncio.sleep(poll_interval)
+            poll_count += 1
+
+            async with session.get(job_url) as poll_response:
+                if poll_response.status != 200:
+                    body = await poll_response.text()
+                    output.error = f"Polling failed HTTP {poll_response.status}: {body}"
+                    output.success = False
+                    _video_debug(
+                        input,
+                        f"poll_fail job_id={job_id} poll_count={poll_count} "
+                        f"http={poll_response.status} body={body}",
+                    )
+                    return output
+
+                poll_json = await poll_response.json()
+                prev_status = job_status
+                job_status = poll_json.get("status")
+                if job_status != prev_status or poll_count == 1:
+                    _video_debug(
+                        input,
+                        f"poll_ok job_id={job_id} poll_count={poll_count} status={job_status}",
+                    )
+
+                if time.perf_counter() >= deadline:
+                    output.error = (
+                        f"Timed out waiting for video job {job_id} to complete "
+                        f"after {timeout_seconds:.1f} seconds."
+                    )
+                    output.success = False
+                    _video_debug(
+                        input,
+                        f"poll_timeout job_id={job_id} last_status={job_status} "
+                        f"timeout_seconds={timeout_seconds:.1f}",
+                    )
+                    return output
+
+        if job_status == "failed":
+            output.error = f"Video job failed: {poll_json}"
+            output.success = False
+            _video_debug(input, f"job_failed job_id={job_id} payload={poll_json}")
+            return output
+
+        # invoke a get request (GET /v1/videos/{video_id}/content)
+        content_url = f"{job_url}/content"
+        async with session.get(content_url) as content_response:
+            if content_response.status != 200:
+                body = await content_response.text()
+                output.error = f"Content retrieval failed HTTP {content_response.status}: {body}"
+                output.success = False
+                _video_debug(input, f"content_fail job_id={job_id} http={content_response.status} body={body}")
+                return output
+
+            video_bytes = await content_response.read()
+            output.response_body = video_bytes
+            output.success = True
+            _video_debug(input, f"content_ok job_id={job_id} bytes={len(video_bytes)}")
+            if "peak_memory_mb" in poll_json:
+                output.peak_memory_mb = poll_json["peak_memory_mb"]
+            elif "peak_memory_mb" in resp_json:
+                output.peak_memory_mb = resp_json["peak_memory_mb"]
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+        _video_debug(input, f"exception error={e}")
+    finally:
+        if image_file is not None:
+            image_file.close()
+
+        if job_id is not None:
+            try:
+                async with session.delete(f"{input.api_url}/{job_id}") as delete_response:
+                    _video_debug(
+                        input,
+                        f"delete_done job_id={job_id} http={delete_response.status}",
+                    )
+            except Exception as e:
+                print(f"Failed to clean up video job {job_id}: {e}")
+
+    output.latency = time.perf_counter() - output.start_time
+
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 backends_function_mapping = {
-    "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
-    "openai": (async_request_openai_images, "/v1/images/generations"),
+    "2i": {
+        "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
+        "openai": (async_request_openai_images, "/v1/images/generations"),
+    },
+    "2v": {
+        "v1/videos": (async_request_v1_videos, "/v1/videos"),
+    },
 }

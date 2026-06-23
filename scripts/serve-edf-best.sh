@@ -1,0 +1,12 @@
+vllm serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --omni \
+      --port 8098 \
+      --num-gpus 4 \
+      --enable-runtime-v2 \
+      --runtime-v2-scheduler-policy edf_best_fit \
+      --runtime-v2-collective-backend gfc \
+      --runtime-v2-gfc-max-collective-mb 1024 \
+      --runtime-v2-cost-model-dir cost-model/wan22-ti2v-5b-fullrange \
+      --runtime-v2-edf-greedy-sp-sizes 1,2,4 \
+      --boundary-ratio 0.875 \
+      --flow-shift 5.0 \
+      --enforce-eager

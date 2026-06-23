@@ -136,3 +136,4 @@ Traffic / concurrency flags:
 
 - `--request-rate`: Target request rate (requests/second). If set to `inf`, the script sends all requests immediately.
 - `--max-concurrency`: Max number of in-flight requests (default: `1`). This can hard-cap the achieved QPS: if it is too small, requests will queue behind the semaphore, and both achieved throughput and observed SLO attainment can be skewed.
+- `--video-job-timeout-seconds`: Client-side timeout while polling `/v1/videos/{id}` until completion (default: `3600`). Only applies to `--backend v1/videos`.

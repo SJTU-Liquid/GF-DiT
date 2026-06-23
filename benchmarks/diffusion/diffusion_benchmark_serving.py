@@ -9,6 +9,7 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 Supports multiple backends:
     - vllm-omni: Uses /v1/chat/completions endpoint (default)
     - openai: Uses /v1/images/generations endpoint
+    - v1/videos: Use /v1/videos endpoint
 
 Usage:
     # Video (vllm-omni backend)
@@ -28,6 +29,16 @@ Usage:
         --backend vllm-omni --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024
 
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --backend vllm-omni --dataset random --task t2i --num-prompts 1 \
+        --max-concurrency 1 --enable-negative-prompt \
+        --random-request-config '[
+            {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
+            {"width":768,"height":768,"num_inference_steps":20,"weight":0.25},
+            {"width":1024,"height":1024,"num_inference_steps":25,"weight":0.45},
+            {"width":1536,"height":1536,"num_inference_steps":35,"weight":0.15}
+        ]'
+
     i2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --backend vllm-omni --dataset vbench --task i2i --num-prompts 10
@@ -38,6 +49,16 @@ Usage:
         --backend openai --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
+    # Video (v1/vedeos)
+    t2v:
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --backend v1/videos --dataset random --task t2v --num-prompts 1 \
+        --max-concurrency 1 --enable-negative-prompt \
+        --random-request-config '[
+            {"width":854,"height":480,"num_inference_steps":18,"num_frames":120,"fps":24,"weight":1}
+        ]'
+
+
 """
 
 import argparse
@@ -45,7 +66,10 @@ import ast
 import asyncio
 import glob
 import json
+import logging
 import os
+import random
+import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -57,7 +81,10 @@ import aiohttp
 import numpy as np
 import requests
 from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
+from PIL import Image
 from tqdm.asyncio import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 class BaseDataset(ABC):
@@ -515,27 +542,198 @@ class TraceDataset(BaseDataset):
         return [self[i] for i in range(len(self))]
 
 
-class RandomDataset(BaseDataset):
+class MixedPriorityDataset(BaseDataset):
+    """Loader for the synthetic mixed-priority JSON workloads produced by
+    ``benchmarks/diffusion/generate_runtime_v2_mixed_priority_workload.py``.
+
+    Each request carries:
+      * shape (height, width, num_frames, num_steps, denoise_chunk_size)
+      * absolute arrival_ms in workload time, mapped to RequestFuncInput.timestamp
+        (in seconds, for ``iter_requests`` to schedule)
+      * client_deadline_ms - arrival_ms -> slo_ms (relative latency budget the
+        existing SLO machinery understands). Falls back to deadline_ms when the
+        workload predates the client/scheduler deadline split. client_deadline_ms
+        adds the fixed end-to-end tax (post-proc/IPC/poll) on top of the
+        scheduler deadline, so the client SLO check is not charged for overhead
+        the policy cannot control.
+      * runtime_v2_priority / runtime_v2_deadline_ms / runtime_v2_arrival_ms /
+        runtime_v2_request_class packed into a JSON ``extra_args`` form field
+        so the server's edf_greedy / edf_best_fit policies can see them. The
+        server's VideoGenerationRequest schema parses the JSON string back to
+        a dict (see vllm_omni/entrypoints/openai/protocol/videos.py).
+      * request_class on the input dataclass for per-class metrics
+    """
+
+    DEFAULT_PROMPTS_BY_CLASS: dict[str, str] = {
+        "S": "a serene lakeside sunrise with mist over the water",
+        "M": "a bustling city street at night with neon signs and people walking",
+        "L": "a sweeping aerial shot over a mountain range at golden hour",
+    }
+    DEFAULT_PROMPT = "a placid scenic landscape in cinematic style"
+
     def __init__(self, args, api_url: str, model: str):
-        self.args = args
-        self.api_url = api_url
-        self.model = model
+        super().__init__(args, api_url, model)
+        path = args.workload_json or args.dataset_path
+        if not path:
+            raise ValueError(
+                "MixedPriorityDataset requires --workload-json (or --dataset-path) "
+                "pointing at a synthetic JSON workload"
+            )
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        if isinstance(doc, dict):
+            self.metadata = doc.get("metadata", {}) or {}
+            self.items: list[dict[str, Any]] = list(doc.get("requests", []) or [])
+        elif isinstance(doc, list):
+            self.metadata = {}
+            self.items = list(doc)
+        else:
+            raise ValueError(f"workload JSON must be a dict or list, got {type(doc).__name__}")
+        if not self.items:
+            raise ValueError(f"workload {path!r} has no requests")
+        if args.num_prompts is not None and args.num_prompts > 0:
+            self.items = self.items[: args.num_prompts]
+
+        # Optional override prompt
+        self.override_prompt = getattr(args, "mixed_priority_prompt", None)
+        # Normalize arrivals to start at 0 so timestamps render as offset-from-now.
+        arrivals = [float(item.get("arrival_ms", 0.0) or 0.0) for item in self.items]
+        self._arrival_zero_ms = min(arrivals) if arrivals else 0.0
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> RequestFuncInput:
+        row = self.items[idx]
+        request_class = str(row.get("request_class") or "M").upper()
+        prompt = (
+            self.override_prompt
+            or self.DEFAULT_PROMPTS_BY_CLASS.get(request_class)
+            or self.DEFAULT_PROMPT
+        )
+        arrival_ms = float(row.get("arrival_ms", 0.0) or 0.0)
+        deadline_ms = row.get("deadline_ms")
+        deadline_ms = float(deadline_ms) if deadline_ms is not None else None
+        # Two distinct deadlines: deadline_ms is the SCHEDULER deadline (GPU
+        # pipeline only) sent to the server's EDF policy; client_deadline_ms
+        # additionally budgets the fixed end-to-end tax (video post-proc,
+        # IPC, bench poll interval) the scheduler cannot control. The
+        # client-side SLO check uses client_deadline_ms when present so it
+        # measures scheduling quality, not measurement overhead.
+        client_deadline_ms = row.get("client_deadline_ms")
+        client_deadline_ms = (
+            float(client_deadline_ms) if client_deadline_ms is not None else deadline_ms
+        )
+        slo_ms = (client_deadline_ms - arrival_ms) if client_deadline_ms is not None else None
+        # Pack runtime_v2 metadata for the server's EDF/best-fit policy. JSON
+        # string because v1/videos POST is multipart/form-data.
+        ea: dict[str, Any] = {
+            "runtime_v2_priority": int(row.get("priority", 0) or 0),
+            "runtime_v2_request_class": request_class,
+            "runtime_v2_arrival_ms": arrival_ms,
+        }
+        if deadline_ms is not None:
+            ea["runtime_v2_deadline_ms"] = deadline_ms
+        # Also surface latent_seq_len etc. for edf_best_fit's finish-time math
+        # (server adapter may also fill these via plan.metadata, but client-side
+        # is a no-cost shortcut).
+        for k in ("latent_seq_len", "voxels", "num_steps", "text_seq_len", "denoise_chunk_size"):
+            if k in row:
+                ea[k] = row[k]
+        extra_body = {"extra_args": json.dumps(ea, sort_keys=True)}
+        # Optionally pin guidance_scale so a legacy server does CFG (its default
+        # is 0.0 = no CFG, vs the runtime_v2 wan adapter's 4.0 fallback). Both
+        # the v1/videos VideoGenerationRequest and the openai ImageGenerationRequest
+        # expose a guidance_scale field, so this aligns either backend.
+        gs = getattr(self.args, "guidance_scale", None)
+        if gs is not None:
+            # Set both experts (TI2V has high/low-noise) to match the runtime_v2
+            # wan adapter, where guidance_high = guidance_scale_2 or guidance_low,
+            # i.e. both default to 4.0 when the client omits guidance.
+            extra_body["guidance_scale"] = float(gs)
+            extra_body["guidance_scale_2"] = float(gs)
+
+        return RequestFuncInput(
+            prompt=prompt,
+            api_url=self.api_url,
+            model=self.model,
+            width=int(row["width"]) if row.get("width") is not None else None,
+            height=int(row["height"]) if row.get("height") is not None else None,
+            num_frames=int(row["num_frames"]) if row.get("num_frames") is not None else None,
+            num_inference_steps=int(row["num_steps"]) if row.get("num_steps") is not None else None,
+            seed=self.args.seed,
+            timestamp=(arrival_ms - self._arrival_zero_ms) / 1000.0,
+            slo_ms=slo_ms,
+            request_class=request_class,
+            request_id=str(row.get("request_id") or f"mp_{idx:06d}"),
+            extra_body=extra_body,
+        )
+
+    def get_requests(self) -> list[RequestFuncInput]:
+        return [self[i] for i in range(len(self))]
+
+
+class RandomDataset(BaseDataset):
+    def __init__(self, args, api_url: str, model: str, enable_negative_prompt: bool = False):
+        super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts
+        self.enable_negative_prompt = enable_negative_prompt
+        self.random_request_config = getattr(args, "random_request_config", None)
+        if self.random_request_config:
+            self.random_request_config = json.loads(self.random_request_config)
+            self._weights = [p["weight"] for p in self.random_request_config]
+
+            self.random_request_config = [
+                {k: v for k, v in p.items() if k != "weight"} for p in self.random_request_config
+            ]
+
+            seed = getattr(args, "random_request_seed", 42)
+            self._rng = random.Random(seed)
+
+            self._sampled_requests = self._rng.choices(
+                self.random_request_config,
+                weights=self._weights,
+                k=self.num_prompts,
+            )
+        else:
+            self._sampled_requests = None
+
+        # Random image generate
+        if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
+            img = Image.new("RGB", (512, 512), (255, 255, 255))
+
+            image_path = os.path.join(tempfile.gettempdir(), "diffusion_benchmark_random_image.png")
+            self._random_image_path = [image_path]
+            img.save(image_path)
+        else:
+            self._random_image_path = None
 
     def __len__(self) -> int:
         return self.num_prompts
 
     def __getitem__(self, idx: int) -> RequestFuncInput:
+        extra_body = {}
+        if self.enable_negative_prompt:
+            extra_body["negative_prompt"] = f"Negative prompt {idx} for benchmarking diffusion models"
+
+        params = {
+            "width": self.args.width,
+            "height": self.args.height,
+            "num_frames": self.args.num_frames,
+            "num_inference_steps": self.args.num_inference_steps,
+            "fps": self.args.fps,
+        }
+        if self._sampled_requests:
+            profile = self._sampled_requests[idx]
+            params.update(profile)
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
-            width=self.args.width,
-            height=self.args.height,
-            num_frames=self.args.num_frames,
-            num_inference_steps=self.args.num_inference_steps,
             seed=self.args.seed,
-            fps=self.args.fps,
+            extra_body=extra_body,
+            image_paths=self._random_image_path,
+            **params,
         )
 
     def get_requests(self) -> list[RequestFuncInput]:
@@ -646,12 +844,28 @@ def _populate_slo_ms_from_warmups(
 async def iter_requests(
     requests_list: list[RequestFuncInput],
     request_rate: float,
+    *,
+    use_trace_arrivals: bool = False,
 ) -> AsyncGenerator[RequestFuncInput, None]:
-    """Yield requests using a fixed interval if request_rate is set.
+    """Yield requests with one of three pacing modes.
 
-    - If request_rate is inf, all requests are yielded immediately (no sleep).
-    - Otherwise, requests are emitted at a fixed cadence of 1 / request_rate seconds.
+    - ``use_trace_arrivals=True``: honor each request's ``timestamp`` (seconds
+      from start of replay) and sleep until that offset before yielding. Used
+      with MixedPriorityDataset; ``request_rate`` is ignored.
+    - ``request_rate == inf``: yield all immediately, no sleep.
+    - otherwise: fixed cadence ``1 / request_rate`` seconds between yields.
     """
+
+    if use_trace_arrivals:
+        start = asyncio.get_event_loop().time()
+        for req in requests_list:
+            target_offset = float(req.timestamp) if req.timestamp is not None else 0.0
+            now_offset = asyncio.get_event_loop().time() - start
+            delay = target_offset - now_offset
+            if delay > 0:
+                await asyncio.sleep(delay)
+            yield req
+        return
 
     if request_rate != float("inf"):
         if request_rate <= 0:
@@ -686,6 +900,7 @@ def calculate_metrics(
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,
         "latency_p99": np.percentile(latencies, 99) if latencies else 0,
+        "latency_p95": np.percentile(latencies, 95) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
         "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
@@ -715,6 +930,70 @@ def calculate_metrics(
             }
         )
 
+    # Per-class breakdown (latency p95, SLO attainment per S/M/L). Driven by
+    # RequestFuncInput.request_class; empty if no request has it set.
+    by_class: dict[str, dict[str, Any]] = {}
+    for req, out in zip(requests_list, outputs):
+        klass = getattr(req, "request_class", None)
+        if not klass:
+            continue
+        bucket = by_class.setdefault(
+            klass,
+            {"n": 0, "completed": 0, "latencies": [], "slo_defined": 0, "slo_met": 0},
+        )
+        bucket["n"] += 1
+        if out.success:
+            bucket["completed"] += 1
+            bucket["latencies"].append(out.latency)
+        if req.slo_ms is not None:
+            bucket["slo_defined"] += 1
+            if out.slo_achieved:
+                bucket["slo_met"] += 1
+    if by_class:
+        per_class: dict[str, dict[str, float]] = {}
+        for klass, bucket in sorted(by_class.items()):
+            lats = bucket["latencies"]
+            per_class[klass] = {
+                "n": bucket["n"],
+                "completed": bucket["completed"],
+                "latency_mean": float(np.mean(lats)) if lats else 0.0,
+                "latency_p50": float(np.percentile(lats, 50)) if lats else 0.0,
+                "latency_p95": float(np.percentile(lats, 95)) if lats else 0.0,
+                "latency_p99": float(np.percentile(lats, 99)) if lats else 0.0,
+                "slo_defined": bucket["slo_defined"],
+                "slo_met": bucket["slo_met"],
+                "slo_attainment_rate": (
+                    bucket["slo_met"] / bucket["slo_defined"]
+                    if bucket["slo_defined"] > 0
+                    else 0.0
+                ),
+            }
+        metrics["per_class"] = per_class
+
+    # Per-request dump for offline lateness analysis. lateness_ms is the
+    # client-side overshoot (latency - slo budget); positive => violated. The
+    # client deadline_const tax cancels (it is in both latency and slo_ms), so
+    # this equals the scheduler-side overshoot too.
+    per_request: list[dict[str, Any]] = []
+    for req, out in zip(requests_list, outputs):
+        slo_ms = getattr(req, "slo_ms", None)
+        lat_ms = (out.latency * 1000.0) if out.success else None
+        lateness_ms = (
+            (lat_ms - slo_ms) if (lat_ms is not None and slo_ms is not None) else None
+        )
+        per_request.append(
+            {
+                "request_id": getattr(req, "request_id", None),
+                "request_class": getattr(req, "request_class", None),
+                "success": bool(out.success),
+                "latency_ms": lat_ms,
+                "slo_ms": slo_ms,
+                "slo_achieved": out.slo_achieved,
+                "lateness_ms": lateness_ms,
+            }
+        )
+    metrics["per_request"] = per_request
+
     return metrics
 
 
@@ -742,8 +1021,38 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = f"http://{args.host}:{args.port}"
 
+    VIDEO_TASKS = {"t2v", "i2v", "ti2v"}
+    IMAGE_TASKS = {"t2i", "i2i", "ti2i"}
+
+    if args.task in VIDEO_TASKS:
+        task_type = "2v"
+    elif args.task in IMAGE_TASKS:
+        task_type = "2i"
+    else:
+        raise ValueError(
+            f"Unsupported task: '{args.task}'. "
+            f"Valid video tasks: {sorted(VIDEO_TASKS)}, "
+            f"Valid image tasks: {sorted(IMAGE_TASKS)}"
+        )
+
+    if args.debug_video_requests:
+        os.environ["VLLM_OMNI_BENCH_VIDEO_DEBUG"] = "1"
+        print("Enabled detailed /v1/videos benchmark request logging.")
+    else:
+        os.environ.pop("VLLM_OMNI_BENCH_VIDEO_DEBUG", None)
+
+    valid_backends = sorted(backends_function_mapping[task_type].keys())
+
+    if args.backend not in valid_backends:
+        logger.error(
+            f"Invalid backend '{args.backend}' for task '{args.task}' (task type: '{task_type}').\n"
+            f"Valid backends for this task type: {valid_backends}\n"
+            f"Example usage: --task {args.task} --backend {valid_backends[0]}"
+        )
+        raise ValueError("Backend validation failed. See log above for valid options.")
+
     # Setup API URL and request function based on backend
-    request_func, api_url = backends_function_mapping[args.backend]
+    request_func, api_url = backends_function_mapping[task_type][args.backend]
     api_url = f"{args.base_url}{api_url}"
 
     if args.dataset == "vbench":
@@ -751,12 +1060,15 @@ async def benchmark(args):
     elif args.dataset == "trace":
         dataset = TraceDataset(args, api_url, args.model)
     elif args.dataset == "random":
-        dataset = RandomDataset(args, api_url, args.model)
+        dataset = RandomDataset(args, api_url, args.model, args.enable_negative_prompt)
+    elif args.dataset == "mixed_priority":
+        dataset = MixedPriorityDataset(args, api_url, args.model)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
     print("Loading requests...")
     requests_list = dataset.get_requests()
+    requests_list = [replace(req, video_job_timeout_seconds=args.video_job_timeout_seconds) for req in requests_list]
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
 
     # Limit concurrency
@@ -802,7 +1114,17 @@ async def benchmark(args):
 
         start_time = time.perf_counter()
         tasks = []
-        async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
+        # Mixed-priority workloads encode per-request arrival_ms; replay the
+        # trace by sleeping to each timestamp instead of using --request-rate.
+        use_trace_arrivals = (
+            args.dataset == "mixed_priority"
+            and any(req.timestamp is not None for req in requests_list)
+        )
+        async for req in iter_requests(
+            requests_list=requests_list,
+            request_rate=args.request_rate,
+            use_trace_arrivals=use_trace_arrivals,
+        ):
             task = asyncio.create_task(limited_request_func(req, session, pbar))
             tasks.append(task)
 
@@ -847,6 +1169,7 @@ async def benchmark(args):
     print("{:<40} {:<15.4f}".format("Latency Mean (s):", metrics["latency_mean"]))
     print("{:<40} {:<15.4f}".format("Latency Median (s):", metrics["latency_median"]))
     print("{:<40} {:<15.4f}".format("Latency P99 (s):", metrics["latency_p99"]))
+    print("{:<40} {:<15.4f}".format("Latency P95 (s):", metrics["latency_p95"]))
 
     if args.slo:
         print(f"{'-' * 50}")
@@ -883,15 +1206,40 @@ if __name__ == "__main__":
         "--backend",
         type=str,
         default="vllm-omni",
-        choices=["vllm-omni", "openai"],
+        choices=["vllm-omni", "openai", "v1/videos"],
         help="Backend to target the benchmark to.",
     )
     parser.add_argument(
         "--dataset",
         type=str,
         default="vbench",
-        choices=["vbench", "trace", "random"],
+        choices=["vbench", "trace", "random", "mixed_priority"],
         help="Dataset to use.",
+    )
+    parser.add_argument(
+        "--workload-json",
+        type=str,
+        default=None,
+        help=(
+            "Path to a synthetic mixed-priority workload JSON (produced by "
+            "generate_runtime_v2_mixed_priority_workload.py). Used with "
+            "--dataset mixed_priority. Per-request arrival_ms gates dispatch; "
+            "slo_ms = deadline_ms - arrival_ms is computed client-side. "
+            "runtime_v2_priority/deadline_ms/arrival_ms are packed into an "
+            "extra_args JSON form field so the server's edf_greedy/edf_best_fit "
+            "policies can read them."
+        ),
+    )
+    parser.add_argument(
+        "--mixed-priority-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Override prompt for every mixed-priority request. Default behavior "
+            "picks a static per-class prompt (S/M/L). Has no effect on output "
+            "quality (prompts are not graded) but pins prompt length for stable "
+            "latency comparisons."
+        ),
     )
     parser.add_argument(
         "--task",
@@ -907,6 +1255,16 @@ if __name__ == "__main__":
         help="Path to local dataset file (optional).",
     )
     parser.add_argument("--num-prompts", type=int, default=10, help="Number of prompts to benchmark.")
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        help="If set, inject this guidance_scale into every request body (mixed_priority "
+        "dataset). Needed to align a legacy server (whose default guidance_scale is 0.0 = "
+        "no CFG) with the runtime_v2 wan adapter, which falls back to default_guidance_scale "
+        "=4.0 (CFG on) when the client omits guidance. Sent as a form field for v1/videos "
+        "and in the JSON payload for the openai image backend.",
+    )
     parser.add_argument(
         "--max-concurrency",
         type=int,
@@ -972,6 +1330,43 @@ if __name__ == "__main__":
         help="SLO target multiplier: slo_ms = estimated_exec_time_ms * slo_scale (default: 3).",
     )
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
+    parser.add_argument(
+        "--debug-video-requests",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable detailed client-side logs for /v1/videos requests "
+            "(POST/poll/content/DELETE with client request_id and job_id mapping)."
+        ),
+    )
+    parser.add_argument(
+        "--video-job-timeout-seconds",
+        type=float,
+        default=3600.0,
+        help=(
+            "Client-side timeout in seconds while polling a /v1/videos job until completion "
+            "(default: 3600). Only applies to --backend v1/videos."
+        ),
+    )
+    parser.add_argument(
+        "--enable-negative-prompt",
+        action="store_true",
+        default=False,
+        help="Generate negative prompts when using the random dataset.",
+    )
+    parser.add_argument(
+        "--random-request-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON string defining random request profiles. "
+            "Each profile may contain: width, height, num_inference_steps, etc. "
+            "The 'weight' field controls sampling probability (relative weight). "
+            "Example: "
+            '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
+            '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
+        ),
+    )
 
     args = parser.parse_args()
 
