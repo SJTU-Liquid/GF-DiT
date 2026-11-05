@@ -56,9 +56,11 @@ from benchmarks.diffusion.policies.step_preempt import (
 )
 from benchmarks.diffusion.policies.tetriserve import (
     TetriServeContinuousPolicy,
+    TetriServeFixedRoundPolicy,
     TetriServeRoundPolicy,
     make_tetriserve_continuous,
     make_tetriserve_round,
+    make_tetriserve_round_fixed,
 )
 
 __all__ = [
@@ -77,6 +79,7 @@ __all__ = [
     "CleanEdfPreemptivePolicy",
     "PrimalDualRollingPlannerPolicy",
     "TetriServeContinuousPolicy", "TetriServeRoundPolicy",
+    "TetriServeFixedRoundPolicy",
     # factories
     "make_static_sp1", "make_static_sp2", "make_static_sp4", "make_static_sp8",
     "make_fcfs", "make_srtf", "make_sjf",
@@ -88,4 +91,5 @@ __all__ = [
     "make_edf_best_fit",
     "make_clean_edf_pause", "make_clean_edf_demote",
     "make_tetriserve_continuous", "make_tetriserve_round",
+    "make_tetriserve_round_fixed",
 ]

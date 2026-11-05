@@ -237,7 +237,7 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=argparse.SUPPRESS,
             choices=(
-                "fcfs", "srtf", "disaggregate", "dynamic_step_fcfs",
+                "fcfs", "srtf", "sjf", "disaggregate", "dynamic_step_fcfs",
                 "edf_greedy", "edf_best_fit", "wave_stress",
             ),
             help=(

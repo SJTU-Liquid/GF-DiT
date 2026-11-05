@@ -1,0 +1,12 @@
+gfc[1041415] INFO TMA disabled (use_tma=False)
+gfc[1041415] INFO per-rank symmetric memory footprint
+gfc[1041415] INFO   comm_buf  : 64.0 MiB
+gfc[1041415] INFO   signal_buf: 2 slots x 3 ranks x 8 B = 48 B
+gfc[1041415] INFO   step_pad  : 24 ch x 257 chunks x 3 ranks x 8 B = 144.6 KiB   (used only by fused path)
+gfc[1041415] INFO   total per rank approx 64.1 MiB   (debug_checks=False)
+gfc[1041415] INFO rank=0 world=3 device=cuda:0 symm_mem enabled (group=0)
+/workspace/vllm-omni-private/.venv/lib/python3.12/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+RESULT {"rank": 0, "mode": "abort", "abort_check": 64, "phase": "healthy", "group": [0, 1, 2], "correct": true, "barrier_median_us": 2433.0, "all_gather_2MiB_median_us": 973.3}
+RESULT {"rank": 0, "mode": "abort", "abort_check": 64, "phase": "peer_crash_mid_collective", "result": "GFCPeerFailure dead_ranks=[2]", "collectives_completed_before_failure": 183, "death_to_detect_ms": 27.3, "death_to_error_ms": 45.9, "cuda_context_usable": true}
+RESULT {"rank": 0, "mode": "abort", "abort_check": 64, "phase": "after_regroup", "group": [0, 1], "register_us": 549.5, "correct": true, "barrier_median_us": 73.6}

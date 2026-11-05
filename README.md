@@ -1,23 +1,24 @@
 <div align="center">
 
-# GF-DiT: Scheduling Parallelism for Diffusion Transformer Serving
+# Plectra: Scheduling Parallelism for Diffusion Transformer Serving
 
 **A policy-programmable runtime for *elastic* Diffusion-Transformer serving — built on [vLLM-Omni](https://github.com/vllm-project/vllm-omni).**
 
-[**Paper** (arXiv:2606.13501)](https://arxiv.org/abs/2606.13501) ·
-[**Group-Free Collectives** (`gfc`)](https://github.com/SJTU-Liquid/group-free-collectives) ·
+**PPoPP 2027** ·
+[**Artifact evaluation guide**](./ae/README.md) ·
+[**Group-Free Collectives** (vendored)](./GroupFree-Collective) ·
 [**vLLM-Omni**](https://github.com/vllm-project/vllm-omni)
 
 </div>
 
 ---
 
-> This repository is the research artifact for **GF-DiT**. GF-DiT is implemented as a
-> task-centric elastic runtime (`runtime_v2`) inside a fork of vLLM-Omni, plus a
-> group-free collective backend. It is **opt-in** — with `--enable-runtime-v2` omitted the
-> server behaves exactly like stock vLLM-Omni.
+> This repository is the research artifact for **Plectra** (PPoPP 2027). Plectra is
+> implemented as a task-centric elastic runtime (`runtime_v2`) inside a fork of vLLM-Omni,
+> plus a group-free collective backend. It is **opt-in** — with `--enable-runtime-v2`
+> omitted the server behaves exactly like stock vLLM-Omni.
 
-## What is GF-DiT
+## What is Plectra
 
 Existing DiT servers pin a request's parallel configuration (TP/SP/CFG degrees, rank set)
 at admission and hold it fixed for the request's entire denoising trajectory. But DiT
@@ -25,7 +26,7 @@ workloads are heterogeneous across requests, across the stages of one request, a
 changing system load — so any single static choice wastes GPUs and degrades service
 quality.
 
-GF-DiT treats **GPU parallelism as a first-class schedulable resource** and adapts the
+Plectra treats **GPU parallelism as a first-class schedulable resource** and adapts the
 parallelism of *running* requests to workload demand and service objectives, via three
 ideas:
 
@@ -37,10 +38,10 @@ ideas:
 - **Policy-programmable scheduling** — pluggable policies decide task order and execution
   layout per objective (throughput, latency, SLO).
 
-Across Qwen-Image / WAN on H20 / H100 / A100, GF-DiT delivers up to **6.01× throughput**,
+Across Qwen-Image and Wan2.2 on H20 and A100 servers, Plectra delivers up to **6.01× throughput**,
 up to **95%** lower mean latency, and up to **90%** fewer SLO violations, while cutting
-communication-group setup from **778 ms to ~60 µs**. See the
-[paper](https://arxiv.org/abs/2606.13501) for the full methodology and results.
+communication-group setup from **778 ms to ~60 µs**. See the paper for the full
+methodology and results.
 
 ## Why elastic parallelism
 
@@ -56,23 +57,23 @@ No single static parallel degree is right for all requests — the optimal seque
 
 Sweet spots also differ *across stages* (text-encode / DiT / VAE decode) and *across time*
 (load, queue depth, free-rank set). One admission-time decision is therefore Pareto-bad for
-part of every workload — which is exactly what GF-DiT removes.
+part of every workload — which is exactly what Plectra removes.
 
 ## How it works
 
-GF-DiT lives under `vllm_omni/diffusion/runtime_v2/` plus the group-free collective backend.
+Plectra lives under `vllm_omni/diffusion/runtime_v2/` plus the group-free collective backend.
 
 | Component               | What it does                                                                    | Code |
 | ----------------------- | ------------------------------------------------------------------------------ | ---- |
 | Task-graph scheduler    | Event-driven dispatch of trajectory tasks; per-request lifecycle               | `runtime_v2/scheduler.py`, `runtime_v2/runner.py` |
 | Elastic migration       | Layout-aware online artifact movement across execution groups (SP reshard)     | `runtime_v2/migration_engine.py`, `runtime_v2/data_plane.py` |
-| Group-free collectives  | µs-cost online group formation/reconfig (`all_gather` / `all2all` / `p2p`)      | `distributed/collective_runtime.py` + [`gfc`](https://github.com/SJTU-Liquid/group-free-collectives) |
+| Group-free collectives  | µs-cost online group formation/reconfig (`all_gather` / `all2all` / `p2p`)      | `distributed/collective_runtime.py` + [`GroupFree-Collective/`](./GroupFree-Collective) |
 | Pluggable policies      | Choose task order + execution layout per objective                             | `runtime_v2/policies/` — FCFS, SRTF, SJF, EDF-greedy, EDF-best-fit, disaggregate, wave-stress |
 | Cost model + simulator  | Per-stage latency model for deadline-aware policies; offline what-if analysis  | `runtime_v2/cost_model.py`, `benchmarks/diffusion/` |
 
 ## Quickstart
 
-GF-DiT builds on vLLM-Omni. Install the base framework (see the upstream
+Plectra builds on vLLM-Omni. Install the base framework (see the upstream
 [installation guide](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)),
 then this fork:
 
@@ -81,7 +82,7 @@ then this fork:
 pip install -e .
 
 # (optional) group-free collectives — enables the elastic group-reconfig path
-pip install git+https://github.com/SJTU-Liquid/group-free-collectives.git
+pip install -e ./GroupFree-Collective
 ```
 
 Serve a DiT model with the elastic runtime enabled:
@@ -120,16 +121,20 @@ Ready-made launch scripts live in `scripts/` — e.g. `serve-adaptive.sh`, `serv
 
 | Flag                                 | Meaning |
 | ------------------------------------ | ------- |
-| `--enable-runtime-v2`                | Turn on the GF-DiT task-graph runtime (opt-in) |
-| `--runtime-v2-scheduler-policy`      | `fcfs` · `srtf` · `disaggregate` · `dynamic_step_fcfs` · `edf_greedy` · `edf_best_fit` · `wave_stress` |
+| `--enable-runtime-v2`                | Turn on the Plectra task-graph runtime (opt-in) |
+| `--runtime-v2-scheduler-policy`      | `fcfs` · `srtf` · `sjf` · `disaggregate` · `dynamic_step_fcfs` · `edf_greedy` · `edf_best_fit` · `wave_stress` |
 | `--runtime-v2-collective-backend`    | `torch` (default, no extra deps) or `gfc` (elastic group reconfig) |
 | `--runtime-v2-denoise-chunk-size`    | Denoise steps per schedulable task chunk |
 | `--runtime-v2-gfc-max-collective-mb` | GFC symmetric-memory budget per rank (MiB) |
 
 ## Reproducing the paper results
 
-Entry points (see the [paper](https://arxiv.org/abs/2606.13501) for the full setup and the
-expected numbers):
+**[`ae/README.md`](./ae/README.md)** is the artifact-evaluation guide: it maps every
+figure, table and number of the paper to a command, most of which run on a CPU in
+minutes (simulator re-runs and re-plots from the raw logs), and provides Docker images
+and scripts for re-measuring on GPUs.
+
+Underlying entry points:
 
 - **Cost-model profiling** — `scripts/profile-stages.sh` (per-host, per-stage latency grid).
 - **Serving benchmark** — `benchmarks/diffusion/diffusion_benchmark_serving.py`
@@ -140,43 +145,29 @@ expected numbers):
 
 ## Relationship to vLLM-Omni
 
-This repository is a fork of [vLLM-Omni](https://github.com/vllm-project/vllm-omni). GF-DiT
+This repository is a fork of [vLLM-Omni](https://github.com/vllm-project/vllm-omni). Plectra
 is additive: it lives under `vllm_omni/diffusion/runtime_v2/` and the GFC collective
 backend, and is gated behind `--enable-runtime-v2`. Base installation, supported models, and
 the OpenAI-compatible server all follow upstream vLLM-Omni — see their
 [documentation](https://vllm-omni.readthedocs.io/en/latest/).
 
+Plectra is built on vLLM-Omni; if you use this artifact, please also cite vLLM-Omni
+([arXiv:2602.02204](https://arxiv.org/abs/2602.02204)).
+
 ## Citation
 
-If you use GF-DiT, please cite:
-
 ```bibtex
-@misc{qiang2026gfditschedulingparallelismdiffusion,
-      title={GF-DiT: Scheduling Parallelism for Diffusion Transformer Serving}, 
-      author={Xinwei Qiang and Yifan Hu and Shixuan Sun and Jing Yang and Han Zhao and Chen Chen and Yu Feng and Jingwen Leng and Minyi Guo},
-      year={2026},
-      eprint={2606.13501},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2606.13501}, 
-}
-```
-
-GF-DiT is built on vLLM-Omni; please also cite their work:
-
-```bibtex
-@misc{yin2026vllmomnifullydisaggregatedserving,
-      title={vLLM-Omni: Fully Disaggregated Serving for Any-to-Any Multimodal Models}, 
-      author={Peiqi Yin and Jiangyun Zhu and Han Gao and Chenguang Zheng and Yongxiang Huang and Taichang Zhou and Ruirui Yang and Weizhi Liu and Weiqing Chen and Canlin Guo and Didan Deng and Zifeng Mo and Cong Wang and James Cheng and Roger Wang and Hongsheng Liu},
-      year={2026},
-      eprint={2602.02204},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2602.02204}, 
+@inproceedings{plectra-ppopp27,
+  title     = {Plectra: Scheduling Parallelism for Diffusion Transformer Serving},
+  author    = {Qiang, Xinwei and Hu, Yifan and Sun, Shixuan and Yang, Jing and Zhao, Han and
+               Chen, Chen and Feng, Yu and Leng, Jingwen and Guo, Minyi},
+  booktitle = {Proceedings of the 32nd ACM SIGPLAN Annual Symposium on Principles and
+               Practice of Parallel Programming (PPoPP '27)},
+  year      = {2027}
 }
 ```
 
 ## License
 
-Apache License 2.0, as found in the [LICENSE](./LICENSE) file. GF-DiT inherits vLLM-Omni's
+Apache License 2.0, as found in the [LICENSE](./LICENSE) file. Plectra inherits vLLM-Omni's
 license.

@@ -641,6 +641,7 @@ class OmniDiffusionConfig:
         if self.runtime_v2_scheduler_policy not in {
             "fcfs",
             "srtf",
+            "sjf",
             "disaggregate",
             "dynamic_step_fcfs",
             "edf_greedy",

@@ -1,0 +1,106 @@
+{
+  "world": 2,
+  "backend": "gfc",
+  "device_name": "NVIDIA H20",
+  "max_groups": 64,
+  "max_collective_mb": 64,
+  "runtime_init_ms": 1028.4937020624056,
+  "runtime_init_mem_mb": 76.0,
+  "sizes": [
+    2
+  ],
+  "churn_size": 2,
+  "churn_count": 16,
+  "size_sweep": [
+    {
+      "size": 2,
+      "register_ms_max": 0.4087189445272088,
+      "register_ms_mean": 0.3437770064920187,
+      "first_coll_ms_max": 79.07405903097242,
+      "warm_coll_ms_max": 0.40457199793308973,
+      "mem_free_drop_mb_max": 0.0
+    }
+  ],
+  "churn": [
+    {
+      "index": 0,
+      "register_ms_max": 0.1224899897351861,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 1,
+      "register_ms_max": 0.07459800690412521,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 2,
+      "register_ms_max": 0.06658700294792652,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 3,
+      "register_ms_max": 0.06537896115332842,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 4,
+      "register_ms_max": 0.061036087572574615,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 5,
+      "register_ms_max": 0.059518963098526,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 6,
+      "register_ms_max": 0.06143504288047552,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 7,
+      "register_ms_max": 0.06315496284514666,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 8,
+      "register_ms_max": 0.06722006946802139,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 9,
+      "register_ms_max": 0.05972303915768862,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 10,
+      "register_ms_max": 0.06024504546076059,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 11,
+      "register_ms_max": 0.05944492295384407,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 12,
+      "register_ms_max": 0.05626899655908346,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 13,
+      "register_ms_max": 0.05985994357615709,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 14,
+      "register_ms_max": 0.057884957641363144,
+      "cumulative_drop_mb": 0.0
+    },
+    {
+      "index": 15,
+      "register_ms_max": 0.058011035434901714,
+      "cumulative_drop_mb": 0.0
+    }
+  ]
+}

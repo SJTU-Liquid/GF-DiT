@@ -191,7 +191,15 @@ class RuntimeV2PolicySimulator:
         # the policy every round_ms so it can re-plan only at round boundaries.
         self.round_ms = max(0.0, float(round_ms))
         policy_wants_rounds = hasattr(self.policy, "on_round_tick")
-        if policy_wants_rounds and self.round_ms <= 0.0:
+        # A policy may declare ``self_scheduled_rounds = True`` to opt out of the
+        # fixed-interval contract: it derives its own round length internally and
+        # re-plans on worker events, so it needs no simulator-driven wake-up.
+        # (TetriServeRoundPolicy computes the round duration from step
+        # granularity, exactly like the released TetriServe, which has no
+        # wall-clock round barrier at all.) For such policies --round-ms is an
+        # optional EXTRA wake-up, not a requirement.
+        policy_self_schedules = bool(getattr(self.policy, "self_scheduled_rounds", False))
+        if policy_wants_rounds and not policy_self_schedules and self.round_ms <= 0.0:
             # A round policy with no round length never opens its dispatch gate,
             # so it would silently complete zero requests. Fail fast instead.
             raise ValueError(

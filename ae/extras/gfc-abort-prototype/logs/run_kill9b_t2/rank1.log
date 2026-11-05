@@ -1,0 +1,5 @@
+gfc[1038304] INFO TMA disabled (use_tma=False)
+gfc[1038304] INFO rank=1 world=3 device=cuda:1 symm_mem enabled (group=0)
+RESULT {"rank": 1, "mode": "abort", "abort_check": 64, "phase": "healthy", "group": [0, 1, 2], "correct": true, "barrier_median_us": 2411.0, "all_gather_2MiB_median_us": 2444.4}
+RESULT {"rank": 1, "mode": "abort", "abort_check": 64, "phase": "peer_crash_mid_collective", "result": "GFCPeerFailure dead_ranks=[2]", "collectives_completed_before_failure": 342, "death_to_detect_ms": 29.5, "death_to_error_ms": 39.1, "cuda_context_usable": true}
+RESULT {"rank": 1, "mode": "abort", "abort_check": 64, "phase": "after_regroup", "group": [0, 1], "register_us": 443.4, "correct": true, "barrier_median_us": 2410.9}

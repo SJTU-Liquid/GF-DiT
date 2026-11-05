@@ -1,0 +1,13 @@
+# Plectra CPU image: everything in the artifact that does not need a GPU.
+#   - ae/sim/run_claims.py   simulator claims (Python standard library only)
+#   - ae/figures/run_all.sh  paper figures/tables from the raw logs (matplotlib + numpy)
+#
+#   docker build -f ae/docker/Dockerfile.cpu -t plectra-ae:cpu .        # from the repository root
+#   docker run --rm -it plectra-ae:cpu
+#   # inside:  python3 ae/sim/run_claims.py --quick && bash ae/figures/run_all.sh
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir matplotlib==3.10.9 numpy==2.2.6
+WORKDIR /workspace/plectra
+COPY . .
+CMD ["bash"]

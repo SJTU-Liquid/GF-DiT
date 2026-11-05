@@ -1,0 +1,4 @@
+gfc[1034883] INFO TMA disabled (use_tma=False)
+gfc[1034883] INFO rank=1 world=3 device=cuda:1 symm_mem enabled (group=0)
+RESULT {"rank": 1, "mode": "watchdog", "abort_check": 0, "phase": "healthy", "group": [0, 1, 2], "correct": true, "barrier_median_us": 2395.2, "all_gather_2MiB_median_us": 2444.0}
+RESULT {"rank": 1, "mode": "watchdog", "abort_check": 0, "phase": "peer_crash_mid_collective", "result": "AcceleratorError: CUDA error: unspecified launch failure\nSearch for `cudaErrorLaunchFailure' in https://docs.nvidia.com/cuda/cuda-runtime-", "death_to_detect_ms": 20.0, "death_to_error_ms": 5429.0, "cuda_context_usable": false, "cuda_error": "AcceleratorError: CUDA error: unspecified launch failure\nSearch for `cudaErrorLaunchFailure' in ht"}

@@ -1,39 +1,55 @@
 # SPDX-License-Identifier: Apache-2.0
 """TetriServe-style step-level SP scheduling for the runtime_v2 simulator.
 
-Implements the two-stage scheduler of TetriServe (arXiv 2510.01565):
+This module holds three policies:
 
-  1. Deadline-aware minimal GPU allocation -- for each active request, find
-     the smallest SP degree whose per-step cost still lets the request finish
-     by its deadline (minimizing GPU-hours k*T(k)).
-  2. Group-knapsack "survival" packing (paper Algorithm 1) -- over the FULL
-     N-GPU pool and ALL active requests (running + pending), pick at most one
-     allocation per request, total GPUs <= N, maximizing the number of
-     requests that remain *not-definitely-late*.
+  * ``TetriServeRoundPolicy`` (factory ``make_tetriserve_round``) -- a direct
+    port of the *released* TetriServe SLO scheduler
+    (``tetriserve/scheduler/dyn_step_scheduler.py::dyn_slo_schedule_global``,
+    ASPLOS'26 artifact). It reproduces, step for step: per-request optimal
+    shape search (``get_optimal_shape_python``), the step-granularity-derived
+    round duration (``_calculate_round_duration``), the DP round scheduler
+    (``_dynamic_programming_combo_search``), bubble-filling scale-up
+    (``_scale_up_ranks_to_fill_bubble``), placement-preserving rank assignment
+    (``_assign_ranks_to_combos``), step synchronization
+    (``_adjust_steps_for_synchronization``) and the step-granularity block
+    chopping of ``_build_schedule_DAG``. See ``ALIGNMENT_REPORT.md`` (scratch)
+    and the per-method docstrings below for the residual divergences.
 
-Two variants share this brain and differ only in *when* they re-plan:
+  * ``TetriServeFixedRoundPolicy`` (factory ``make_tetriserve_round_fixed``) --
+    the PREVIOUS, unfaithful round variant: a fixed wall-clock round barrier
+    of ``--round-ms`` with no step-granularity round duration and no step
+    synchronization. Kept only so the alignment report can quantify what the
+    old approximation cost. Do not use it as "the TetriServe baseline".
 
-  * ``TetriServeContinuousPolicy`` (factory ``make_tetriserve_continuous``)
-    re-plans on every chunk-completion / arrival event. Because ranks free
-    up asynchronously (a request finishes its chunk one rank at a time), it
-    cannot assemble a wide SP group from a single event's free ranks. It
-    therefore *reserves* ranks: when the global plan wants SP=k for an urgent
-    request but only j<k ranks are free, it holds those j ranks idle (blocking
-    lower-priority requests from grabbing them) and waits for the in-flight
-    chunks the plan chose to drain to reach their step boundary. No mid-chunk
-    preemption. The drain idle is bounded by one chunk, far smaller than a
-    fixed round.
+  * ``TetriServeContinuousPolicy`` (factory ``make_tetriserve_continuous``) --
+    OUR event-driven variant. It keeps TetriServe's deadline-aware minimal
+    allocation + survival knapsack but re-plans on every chunk-completion /
+    arrival event and reserves ranks across asynchronous drains. This is not a
+    port; it is the contrast case.
 
-  * ``TetriServeRoundPolicy`` (in ``tetriserve_round.py``) re-plans only at
-    fixed round boundaries -- faithful to the paper, and the baseline whose
-    round-boundary fragmentation this continuous variant is meant to beat.
+Notes on the released scheduler that drive the port's structure:
 
-The deadline-aware allocation + dynamic group synthesis + placement
-preservation are reused from EdfBestFitPolicy / EdfGreedyPolicy.
+  * TetriServe's ``schedule()`` is invoked from ``_CServeEngine.schedule_tasks``
+    on EVERY task completion and on every arrival, over the currently-FREE rank
+    pool (``Scheduler.ranks`` shrinks on dispatch, grows on completion). There
+    is no wall-clock round barrier anywhere in the released code. The "round"
+    is a *work-commit horizon*: a planning call decides how many denoising
+    steps each admitted request executes before the scheduler reconsiders it.
+  * The DAG built at the end of a planning call is *replaced* wholesale on the
+    next call (``schedule_cache.update_schedule_DAG``), and blocks of one combo
+    are chained on their shared ranks, so only the FIRST block of each combo
+    (at most ``_get_step_granularity`` steps) is ever executed before the next
+    re-plan. The port therefore commits
+    ``min(sync_truncated_steps, _get_step_granularity(pixels))`` steps.
+  * ``greedy_bin_packing_exhaustive`` ``break``s after one iteration, so
+    ``rank_time`` is all-zero: step synchronization truncates every combo to
+    the *shortest* admitted combo's duration.
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 import os
 from typing import Iterable
@@ -53,6 +69,22 @@ from benchmarks.diffusion.policies.edf_best_fit import (
     EdfBestFitPolicy,
     _EdfBestFitRequestMeta,
 )
+
+# ---------------------------------------------------------------------------
+# Constants lifted verbatim from the released TetriServe scheduler.
+# ---------------------------------------------------------------------------
+
+# dyn_step_scheduler.py:31 -- "7% tolerance for SLO compliance:
+# latency <= target_slo * 1.07". The released scheduler uses this inside its
+# survival predicate AND its reported SLO metric. Our runner's metric has NO
+# tolerance (`finish <= deadline_ms`), so keeping 0.07 makes the ported
+# scheduler slightly optimistic about its own deadlines; `make_tetriserve_round`
+# exposes TETRISERVE_SLO_TOLERANCE for the sensitivity check reported in
+# ALIGNMENT_REPORT.md.
+SLO_TOLERANCE = 0.07
+
+# The GPU configurations TetriServe enumerates everywhere (1/2/4/8 GPUs).
+_GPU_COUNTS = (1, 2, 4, 8)
 
 
 class TetriServeContinuousPolicy(EdfBestFitPolicy):
@@ -401,9 +433,14 @@ class TetriServeContinuousPolicy(EdfBestFitPolicy):
         return max(0, meta.num_steps - completed)
 
 
-class TetriServeRoundPolicy(TetriServeContinuousPolicy):
-    """Faithful round-based TetriServe (Route B): re-plan ONLY at fixed round
-    boundaries.
+class TetriServeFixedRoundPolicy(TetriServeContinuousPolicy):
+    """DEPRECATED, kept for the alignment report only.
+
+    The PREVIOUS (unfaithful) round variant: re-plan ONLY at fixed wall-clock
+    round boundaries of ``--round-ms``. The released TetriServe has no such
+    barrier -- it derives a round *duration* from step granularity and
+    synchronizes combos to remove the end-of-round bubble. Use
+    ``TetriServeRoundPolicy`` for anything that claims to be TetriServe.
 
     Admission and SP allocation happen exclusively on ``on_round_tick`` (driven
     by the simulator's fixed round_ms ticks). Within a round, an already-admitted
@@ -511,6 +548,727 @@ class TetriServeRoundPolicy(TetriServeContinuousPolicy):
         return self.round_ms
 
 
+class _TetriCombo:
+    """One entry of TetriServe's ``best_combo_list``: (req_idx, rank_group,
+    req_step, req_time). ``gi`` is the log2 GPU-config index into shape_state."""
+
+    __slots__ = ("idx", "gpus", "gi", "steps")
+
+    def __init__(self, idx: int, gpus: int, gi: int, steps: int) -> None:
+        self.idx = idx
+        self.gpus = gpus
+        self.gi = gi
+        self.steps = steps
+
+
+class _TetriCandidate:
+    """One entry of TetriServe's ``unscheduled_reqs`` plus its ``shape_state``
+    row (steps allocated to the 1/2/4/8-GPU configs)."""
+
+    __slots__ = ("request_id", "task", "meta", "pixels", "shape", "remaining")
+
+    def __init__(self, request_id, task, meta, pixels, shape, remaining) -> None:
+        self.request_id = request_id
+        self.task = task
+        self.meta = meta
+        self.pixels = pixels
+        self.shape = shape
+        self.remaining = remaining
+
+
+class TetriServeRoundPolicy(TetriServeContinuousPolicy):
+    """Aligned port of the released TetriServe SLO scheduler.
+
+    Maps ``dyn_slo_schedule_global()`` onto our task-graph interface. One call
+    to :meth:`_take_dispatchable_tasks` == one call to their ``schedule()``:
+    it re-plans over the currently-FREE rank pool, exactly like theirs (their
+    ``self.ranks`` is the free-rank list, and ``schedule_tasks()`` runs on every
+    task completion and arrival). The ordering of the planning stages mirrors
+    ``dyn_slo_schedule_global`` line for line:
+
+      1. ``_filter_and_prepare_requests``  -> :meth:`_candidates`
+         (drop running requests, FCFS order, truncate to the free-GPU count)
+      2. ``_compute_optimal_shapes`` / ``get_optimal_shape_python``
+                                          -> :meth:`_optimal_shape`
+      3. ``_calculate_round_duration``     -> :meth:`_round_duration_ms`
+      4. ``_dynamic_programming_combo_search`` -> :meth:`_dp_combo_search`
+      5. ``_scale_up_ranks_to_fill_bubble``-> :meth:`_scale_up_to_fill_bubble`
+      6. ``_assign_ranks_to_combos``       -> :meth:`_assign_ranks`
+      7. ``_adjust_steps_for_synchronization`` -> :meth:`_synchronize_steps`
+      8. ``_build_schedule_DAG`` block chopping -> the
+         ``min(steps, _get_step_granularity(pixels))`` commit cap
+
+    Because their engine hands a whole (req, ranks, steps) block to a runner as
+    ONE unit while our plan is one task per denoising step, a combo becomes a
+    *commitment*: the request runs exactly ``steps`` ``DIT_STEP_CHUNK`` tasks
+    back-to-back on the assigned ranks and is invisible to the planner until the
+    commitment drains (mirroring ``running_requests`` exclusion in theirs).
+
+    There is no wall-clock round barrier: the round *duration* is an internal
+    horizon computed from step granularity, never a gate. ``--round-ms`` is
+    therefore optional (``self_scheduled_rounds``); if supplied, its ticks are
+    just extra harmless re-plans.
+    """
+
+    # Tells RuntimeV2PolicySimulator this policy derives its own round length
+    # and does not need simulator-driven ticks, so --round-ms may be 0.
+    self_scheduled_rounds = True
+
+    def __init__(
+        self,
+        *args,
+        gpu_is_h100: bool = False,
+        slo_tolerance: float = SLO_TOLERANCE,
+        placement_preserving: bool = True,
+        admission_order: str = "fcfs",
+        candidate_limit: str = "free",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        # get_gpu_name() == "H100_HBM3" selects a different granularity /
+        # MIN_STEPS_PER_CONFIG / scale-up branch in the released code. Our cost
+        # model is H20, so the non-H100 branch is the faithful one.
+        self.gpu_is_h100 = bool(gpu_is_h100)
+        self.slo_tolerance = float(slo_tolerance)
+        self.placement_preserving = bool(placement_preserving)
+        # Sensitivity knobs for the alignment report. The faithful settings are
+        # the defaults; they are NOT tuned. "edf" / "all" exist only to show
+        # whether the gap vs our EDF policy is an artifact of TetriServe's FCFS
+        # admission order and its truncation of the candidate list.
+        if admission_order not in {"fcfs", "edf"}:
+            raise ValueError(f"admission_order must be fcfs|edf, got {admission_order!r}")
+        if candidate_limit not in {"free", "all"}:
+            raise ValueError(f"candidate_limit must be free|all, got {candidate_limit!r}")
+        self.admission_order = admission_order
+        self.candidate_limit = candidate_limit
+        # Unused by the algorithm; kept so the simulator's round-tick plumbing
+        # can still set it without AttributeError.
+        self.round_ms = 0.0
+        self._pixels: dict[str, int] = {}
+        # Live work commitments (a combo that has not finished its steps yet).
+        self._commit_steps: dict[str, int] = {}
+        self._commit_ranks: dict[str, tuple[int, ...]] = {}
+        self._frontier_cache: dict[tuple[int, int, int], tuple] = {}
+        self._tstep_cache: dict[tuple[int, int], float] = {}
+        # Diagnostics for the alignment report (never used for decisions).
+        self.round_duration_samples: list[float] = []
+        self.commit_step_samples: list[int] = []
+        self.sync_truncations = 0  # combos whose steps _synchronize_steps reduced
+        self.sync_combos = 0  # combos _synchronize_steps looked at
+        self.block_cap_hits = 0  # combos capped by _get_step_granularity instead
+
+    # ---- bookkeeping ------------------------------------------------------
+
+    def on_request_submitted(self, plan: RequestExecutionPlan):
+        # TetriServe keys step granularity on the IMAGE size (height*width),
+        # not on the attention sequence length. Capture it before super()
+        # dispatches, since planning may run inside on_request_submitted.
+        value = plan.initial_artifacts[0].value if plan.initial_artifacts else None
+        height = int(getattr(value, "height", 0) or 0)
+        width = int(getattr(value, "width", 0) or 0)
+        self._pixels[plan.request_id] = max(1, height * width)
+        return super().on_request_submitted(plan)
+
+    def _release_dispatched_task(self, event: WorkerEvent):
+        task = self._task_index.get(event.task_id)
+        if task is not None and task.kind == TaskKind.DIT_STEP_CHUNK:
+            done = 1
+            if task.step_range is not None:
+                done = max(1, int(task.step_range.end) - int(task.step_range.start))
+            left = self._commit_steps.get(event.request_id, 0)
+            if left > 0:
+                left -= done
+                if left <= 0:
+                    self._clear_commitment(event.request_id)
+                else:
+                    self._commit_steps[event.request_id] = left
+        super()._release_dispatched_task(event)
+
+    def _drop_request(self, request_id: str) -> None:
+        self._clear_commitment(request_id)
+        self._pixels.pop(request_id, None)
+        super()._drop_request(request_id)
+
+    def _clear_commitment(self, request_id: str) -> None:
+        self._commit_steps.pop(request_id, None)
+        self._commit_ranks.pop(request_id, None)
+
+    def on_round_tick(self, now_ms: float):
+        # The port needs no wall-clock ticks (its round length is internal), but
+        # honouring them keeps --round-ms usable as an extra wake-up. A tick is
+        # just a re-plan, identical to what an arrival/completion triggers.
+        self.now_ms = max(self.now_ms, float(now_ms))
+        return self._take_dispatchable_tasks()
+
+    # ---- one planning call == one TetriServe schedule() -------------------
+
+    def _take_dispatchable_tasks(self):
+        if self.task_runtime_estimator is None:
+            # No cost model -> no deadline math and no perf model; degrade to
+            # the base best-fit policy rather than fabricating estimates.
+            return EdfBestFitPolicy._take_dispatchable_tasks(self)
+
+        free_ranks = self._free_rank_set()
+        out: list[InferenceTask] = []
+        ready_dit: list[tuple[str, InferenceTask]] = []
+        ready_aux: list[tuple[str, InferenceTask]] = []
+        for request_id, queue in self.ready_by_request.items():
+            if not queue or self.request_inflight.get(request_id, 0) > 0:
+                continue
+            task = queue[0]
+            if task.group_id is not None:
+                placement = self._select_placement(task, free_ranks)
+                if placement is not None:
+                    group_id, ranks = placement
+                    self._dispatch(task, request_id, group_id, ranks)
+                    free_ranks.difference_update(ranks)
+                    out.append(task)
+            elif task.kind in self._SINGLE_RANK_TASK_KINDS:
+                ready_aux.append((request_id, task))
+            elif task.kind in self._DIT_TASK_KINDS:
+                ready_dit.append((request_id, task))
+
+        # Aux stages (text_encode / VAE / finalize). TetriServe has no separate
+        # aux tasks -- text encoding runs inside the request's own block on its
+        # assigned ranks and is explicitly excluded from the step-scheduling
+        # cost model (`is_text_encoding_time_included=False`). Our plan exposes
+        # them as separate single-rank tasks, so we dispatch them first in EDF
+        # order, identically to TetriServeContinuousPolicy, to keep the two
+        # variants comparable. See ALIGNMENT_REPORT.md "residual differences".
+        ready_aux.sort(key=lambda rt: self._sort_key(rt[0]))
+        for request_id, task in ready_aux:
+            if not free_ranks:
+                break
+            rank = (min(free_ranks),)
+            group = self._ensure_group_for_ranks(
+                ranks=rank, supported_task_kinds=self._STANDARD_TASK_KINDS
+            )
+            self._dispatch(task, request_id, group.group_id, rank)
+            free_ranks.difference_update(rank)
+            out.append(task)
+
+        # Honour live commitments FIRST: a combo that TetriServe would have
+        # dispatched as one multi-step block keeps running on its ranks and is
+        # excluded from re-planning (their `running_requests` filter).
+        pending: list[tuple[str, InferenceTask]] = []
+        for request_id, task in ready_dit:
+            if self._commit_steps.get(request_id, 0) <= 0:
+                pending.append((request_id, task))
+                continue
+            ranks = self._commit_ranks.get(request_id, ())
+            if ranks and set(ranks).issubset(free_ranks):
+                group = self._ensure_group_for_ranks(
+                    ranks=tuple(ranks), supported_task_kinds=self._DIT_TASK_KINDS
+                )
+                self._dispatch(task, request_id, group.group_id, tuple(ranks))
+                free_ranks.difference_update(ranks)
+                out.append(task)
+            else:
+                # Its ranks were taken by a same-timestamp dispatch (an artifact
+                # of our per-event policy calls, which theirs does not have).
+                # Drop the commitment and let the planner re-decide.
+                self._clear_commitment(request_id)
+                pending.append((request_id, task))
+
+        out.extend(self._plan_round(pending, free_ranks))
+        return out
+
+    def _plan_round(
+        self, pending: list[tuple[str, InferenceTask]], free_ranks: set[int]
+    ) -> list[InferenceTask]:
+        """dyn_slo_schedule_global(), one iteration of greedy_bin_packing_exhaustive."""
+        if not pending or not free_ranks:
+            return []
+        world = len(free_ranks)
+
+        candidates = self._candidates(pending, world)
+        if not candidates:
+            return []
+
+        round_duration = self._round_duration_ms(candidates)
+        self.round_duration_samples.append(round_duration)
+        if round_duration <= 0.0:
+            return []
+
+        combos = self._dp_combo_search(candidates, round_duration, world)
+        if not combos:
+            return []
+
+        # dyn_slo_schedule_global:1512 -- largest rank group first.
+        combos.sort(key=lambda c: c.gpus, reverse=True)
+        self._scale_up_to_fill_bubble(combos, candidates, world)
+        rank_groups = self._assign_ranks(combos, candidates, free_ranks)
+        self._synchronize_steps(combos, candidates)
+
+        out: list[InferenceTask] = []
+        for combo, ranks in zip(combos, rank_groups):
+            if combo.steps <= 0 or len(ranks) != combo.gpus:
+                continue
+            cand = candidates[combo.idx]
+            # _build_schedule_DAG chops a combo into blocks of
+            # _get_step_granularity(seq_len) steps, chained on the shared ranks;
+            # the next schedule() replaces the DAG, so only the first block ever
+            # runs. Commit exactly that first block.
+            block_cap = self._block_step_granularity(cand.pixels)
+            steps = min(combo.steps, block_cap)
+            if block_cap < combo.steps:
+                self.block_cap_hits += 1
+            ranks_t = tuple(sorted(ranks))
+            group = self._ensure_group_for_ranks(
+                ranks=ranks_t, supported_task_kinds=self._DIT_TASK_KINDS
+            )
+            self._dispatch(cand.task, cand.request_id, group.group_id, ranks_t)
+            self._commit_steps[cand.request_id] = int(steps)
+            self._commit_ranks[cand.request_id] = ranks_t
+            self.commit_step_samples.append(int(steps))
+            out.append(cand.task)
+        return out
+
+    # ---- stage 1: _filter_and_prepare_requests + _compute_optimal_shapes --
+
+    def _candidates(
+        self, pending: list[tuple[str, InferenceTask]], world: int
+    ) -> list[_TetriCandidate]:
+        """``_filter_and_prepare_requests`` (dyn_step_scheduler.py:860).
+
+        Their ``request_tracker.get_merged_requests()`` walks ``req_id`` in
+        insertion (= arrival) order, so the candidate list is FCFS, and it is
+        then truncated to the number of FREE GPUs. Note their
+        ``_group_requests_by_sequence_length`` result (which would sort by
+        latency threshold) is computed at dyn_slo_schedule_global:1409 and never
+        read -- it is dead code, so admission order really is FCFS, not EDF.
+        """
+        if self.admission_order == "edf":
+            ordered = sorted(pending, key=lambda rt: self._sort_key(rt[0]))
+        else:
+            ordered = sorted(pending, key=lambda rt: self._arrival_key(rt[0]))
+        if self.candidate_limit == "free":
+            ordered = ordered[:world]
+        out: list[_TetriCandidate] = []
+        for request_id, task in ordered:
+            meta = self.request_meta.get(request_id)
+            if meta is None:
+                continue
+            remaining = self._remaining_steps(request_id)
+            if remaining <= 0:
+                continue
+            shape = self._optimal_shape(
+                meta.latent_seq_len, remaining, world, self._budget_ms(meta)
+            )
+            if sum(shape) <= 0:
+                continue
+            out.append(
+                _TetriCandidate(
+                    request_id=request_id,
+                    task=task,
+                    meta=meta,
+                    pixels=self._pixels.get(request_id, meta.latent_seq_len),
+                    shape=shape,
+                    remaining=remaining,
+                )
+            )
+        return out
+
+    def _arrival_key(self, request_id: str):
+        meta = self.request_meta.get(request_id)
+        if meta is None:
+            return (math.inf, 0, request_id)
+        return (meta.arrival_ms, meta.order, request_id)
+
+    def _budget_ms(self, meta) -> float:
+        """``latency_threshold + arrival_time - get_current_time()``
+        (get_optimal_shape:465). Compared against DENOISING time only -- their
+        optimal-shape search excludes text encoding, so it is measured against
+        the wall-clock deadline without reserving time for the other stages."""
+        deadline = meta.deadline_ms
+        if deadline is None or not math.isfinite(deadline):
+            return math.inf
+        return float(deadline) - self.now_ms
+
+    # ---- stage 2: get_optimal_shape_python -------------------------------
+
+    def _optimal_shape(
+        self, latent_seq_len: int, num_steps: int, world: int, budget_ms: float
+    ) -> list[int]:
+        """``get_optimal_shape_python`` (dyn_step_scheduler.py:484).
+
+        Minimize GPU-hours ``sum(r_k * t_k * k)`` over allocations of
+        ``num_steps`` denoising steps to the 1/2/4/8-GPU configs, subject to
+        ``sum(r_k * t_k) <= budget``; if nothing fits, take the allocation with
+        the smallest total time (their ``failed_shape``).
+
+        Their triple ``for`` loop is O(n^3) per request per planning call, which
+        is far too slow here (thousands of planning calls). We precompute, per
+        (latent_seq_len, num_steps, world), the Pareto staircase of
+        (total_time -> min GPU-hours) over the SAME candidate set and answer any
+        budget with a bisect. Same enumeration, same objective, same tie-break
+        on total time; only the evaluation order differs. ``MIN_STEPS_PER_CONFIG``
+        is 1 on non-H100 (dyn_step_scheduler.py:520-523), i.e. inert, so the
+        released two-pass retry is a no-op and is not reproduced.
+        """
+        key = (int(latent_seq_len), int(num_steps), int(world))
+        frontier = self._frontier_cache.get(key)
+        if frontier is None:
+            frontier = self._build_shape_frontier(latent_seq_len, num_steps, world)
+            self._frontier_cache[key] = frontier
+        times, shapes, fallback = frontier
+        if not times:
+            return [0, 0, 0, 0]
+        idx = bisect.bisect_right(times, budget_ms) - 1
+        if idx < 0:
+            return list(fallback)
+        return list(shapes[idx])
+
+    def _build_shape_frontier(self, latent_seq_len: int, num_steps: int, world: int):
+        per_step = []
+        for gpus in _GPU_COUNTS:
+            cost = self._t_step(latent_seq_len, gpus) if gpus <= world else -1.0
+            per_step.append(cost if cost > 0 else -1.0)
+        allowed = [i for i, cost in enumerate(per_step) if cost > 0]
+        if not allowed or num_steps <= 0:
+            return ([], [], (0, 0, 0, 0))
+
+        cands: list[tuple[float, float, tuple[int, ...]]] = []
+        cur = [0, 0, 0, 0]
+
+        def recurse(pos: int, left: int) -> None:
+            if pos == len(allowed) - 1:
+                cur[allowed[pos]] = left
+                total = sum(cur[i] * per_step[i] for i in allowed)
+                gpu_hours = sum(cur[i] * per_step[i] * _GPU_COUNTS[i] for i in allowed)
+                cands.append((total, gpu_hours, tuple(cur)))
+                cur[allowed[pos]] = 0
+                return
+            for value in range(left + 1):
+                cur[allowed[pos]] = value
+                recurse(pos + 1, left - value)
+            cur[allowed[pos]] = 0
+
+        recurse(0, num_steps)
+        cands.sort(key=lambda c: (c[0], c[1]))
+        times: list[float] = []
+        shapes: list[tuple[int, ...]] = []
+        best = math.inf
+        for total, gpu_hours, shape in cands:
+            if gpu_hours < best - 1e-9:
+                best = gpu_hours
+                if times and abs(times[-1] - total) < 1e-12:
+                    shapes[-1] = shape
+                else:
+                    times.append(total)
+                    shapes.append(shape)
+        return (times, shapes, cands[0][2])
+
+    def _t_step(self, latent_seq_len: int, gpus: int) -> float:
+        """``_get_time_per_step`` / ``get_split_batch_time`` with batch_size 1.
+
+        With bs=1 ``get_split_batch`` returns (1, gpu_num) (splitable=False), so
+        ``get_split_batch_time(bs, seq, steps, g) == per_step(g) * steps``. Our
+        workloads are one video per request, so bs is always 1 and every
+        batch-splitting path in TetriServe is the identity -- see
+        ALIGNMENT_REPORT.md on batching.
+        """
+        key = (int(latent_seq_len), int(gpus))
+        cached = self._tstep_cache.get(key)
+        if cached is None:
+            cached = self._safe_estimate(
+                ParallelSpec(tp=1, sp=int(gpus), cfg=1),
+                int(latent_seq_len),
+                "dit_step_chunk",
+            )
+            self._tstep_cache[key] = cached
+        return cached
+
+    # ---- stage 3: _calculate_round_duration ------------------------------
+
+    def _round_step_granularity(self, pixels: int) -> int:
+        """Inline granularity of ``_calculate_round_duration`` (line 971-980).
+        NOTE this differs from ``_get_step_granularity`` in the released code."""
+        if self.gpu_is_h100:
+            return 4 if pixels >= 1024 * 1024 else 10
+        return 2 if pixels >= 1024 * 1024 else 20
+
+    def _block_step_granularity(self, pixels: int) -> int:
+        """``_get_step_granularity`` (line 1239), used by ``_build_schedule_DAG``
+        to chop a combo into executable blocks. Identical on both GPU branches."""
+        if pixels > 2048 * 2048:
+            return 2
+        if pixels >= 1024 * 1024:
+            return 4
+        return 10
+
+    def _round_duration_ms(self, candidates: list[_TetriCandidate]) -> float:
+        """``_calculate_round_duration`` (line 945): the max time any remaining
+        request needs to complete ONE step granularity at a GPU count its
+        optimal shape actually uses."""
+        best = 0.0
+        for cand in candidates:
+            granularity = self._round_step_granularity(cand.pixels)
+            for gi, gpus in enumerate(_GPU_COUNTS):
+                if cand.shape[gi] > 0:
+                    best = max(
+                        best,
+                        self._t_step(cand.meta.latent_seq_len, gpus) * granularity,
+                    )
+        return best
+
+    # ---- stage 4: _dynamic_programming_combo_search ----------------------
+
+    def _survives(self, meta, finish_ms: float) -> bool:
+        """Survival predicate of the DP (lines 2032-2041 / 2110-2117), including
+        the SLO_TOLERANCE band."""
+        deadline = meta.deadline_ms
+        if deadline is None or not math.isfinite(deadline):
+            return True
+        if finish_ms <= deadline:
+            return True
+        threshold = float(deadline) - float(meta.arrival_ms)
+        if threshold <= 0:
+            return False
+        return abs(finish_ms - deadline) / threshold <= self.slo_tolerance
+
+    def _shape_time_ms(self, cand: _TetriCandidate, shape) -> float:
+        return sum(
+            self._t_step(cand.meta.latent_seq_len, gpus) * shape[gi]
+            for gi, gpus in enumerate(_GPU_COUNTS)
+            if shape[gi] > 0
+        )
+
+    def _dp_combo_search(
+        self, candidates: list[_TetriCandidate], round_duration: float, capacity: int
+    ) -> list[_TetriCombo]:
+        """``_dynamic_programming_combo_search`` (dyn_step_scheduler.py:1977).
+
+        Options per request: "skip" (0 GPUs) or "schedule at 2^gi GPUs" for each
+        config its optimal shape uses, taking as many steps as fit in
+        ``round_duration``. Group knapsack over the free-GPU capacity maximizing
+        the lexicographic objective (survivors, scheduled count, GPUs used).
+
+        DIVERGENCE: their plan reconstruction walks a per-request back-pointer
+        array that is deep-copied forward and can re-select the same request or
+        terminate early (lines 2143-2259). We keep their option construction,
+        transition and objective verbatim but reconstruct the plan correctly
+        from a per-(request, capacity) choice table. A correct reconstruction can
+        only realise a schedule at least as good under their own objective, so
+        this favours TetriServe.
+        """
+        now = self.now_ms
+        round_end = now + round_duration
+        options: list[list[tuple[int, int, int, int]]] = []  # (gpus, steps, surv, sched)
+        for cand in candidates:
+            opts: list[tuple[int, int, int, int]] = []
+            skip_lb = self._shape_time_ms(cand, cand.shape)
+            opts.append((0, 0, 1 if self._survives(cand.meta, round_end + skip_lb) else 0, 0))
+            for gi, gpus in enumerate(_GPU_COUNTS):
+                if cand.shape[gi] == 0:
+                    continue
+                if gpus > capacity:
+                    break
+                per_step = self._t_step(cand.meta.latent_seq_len, gpus)
+                if per_step <= 0:
+                    continue
+                steps = min(cand.shape[gi], int(round_duration // per_step))
+                if steps <= 0:
+                    continue
+                after = list(cand.shape)
+                after[gi] -= steps
+                finish = now + per_step * steps + self._shape_time_ms(cand, after)
+                opts.append(
+                    (gpus, steps, 1 if self._survives(cand.meta, finish) else 0, 1)
+                )
+            options.append(opts)
+
+        neg = (-math.inf, -1, -1)
+        table: list[tuple] = [neg] * (capacity + 1)
+        table[0] = (0.0, 0, 0)
+        choice: list[list[tuple[int, int] | None]] = [
+            [None] * (capacity + 1) for _ in options
+        ]
+        for req_idx, opts in enumerate(options):
+            nxt: list[tuple] = [neg] * (capacity + 1)
+            for used in range(capacity + 1):
+                if table[used][0] == -math.inf:
+                    continue
+                for opt_idx, (gpus, _steps, surv, sched) in enumerate(opts):
+                    total = used + gpus
+                    if total > capacity:
+                        continue
+                    cand_state = (
+                        table[used][0] + surv,
+                        table[used][1] + sched,
+                        table[used][2] + gpus,
+                    )
+                    if cand_state > nxt[total]:
+                        nxt[total] = cand_state
+                        choice[req_idx][total] = (used, opt_idx)
+            table = nxt
+
+        best_capacity = 0
+        best_state = table[0]
+        for used in range(1, capacity + 1):
+            if table[used] > best_state:
+                best_state = table[used]
+                best_capacity = used
+
+        combos: list[_TetriCombo] = []
+        used = best_capacity
+        for req_idx in range(len(options) - 1, -1, -1):
+            picked = choice[req_idx][used]
+            if picked is None:
+                break
+            prev_used, opt_idx = picked
+            gpus, steps, _surv, sched = options[req_idx][opt_idx]
+            if sched:
+                combos.append(
+                    _TetriCombo(
+                        idx=req_idx,
+                        gpus=gpus,
+                        gi=int(math.log2(gpus)),
+                        steps=steps,
+                    )
+                )
+            used = prev_used
+        combos.reverse()
+        return combos
+
+    # ---- stage 5: _scale_up_ranks_to_fill_bubble -------------------------
+
+    def _scale_up_to_fill_bubble(
+        self, combos: list[_TetriCombo], candidates: list[_TetriCandidate], world: int
+    ) -> None:
+        """``_scale_up_ranks_to_fill_bubble`` (dyn_step_scheduler.py:995).
+
+        Enabled unconditionally on non-H100. Doubles a combo's GPU count while
+        that is strictly faster per step and still fits, never reaching 8.
+        ``rank_used`` accumulates across combos exactly as their
+        ``updated_best_rank_used`` does.
+        """
+        if self.gpu_is_h100:
+            return
+        rank_used = sum(combo.gpus for combo in combos)
+        if rank_used >= world:
+            return
+        for combo in combos:
+            cand = candidates[combo.idx]
+            original = combo.gpus
+            needed = original
+            while rank_used + needed * 2 - original <= world:
+                current = self._t_step(cand.meta.latent_seq_len, needed)
+                doubled = self._t_step(cand.meta.latent_seq_len, needed * 2)
+                if doubled <= 0 or current <= doubled:
+                    break
+                if needed * 2 == 8:
+                    break
+                needed *= 2
+            if needed != original:
+                rank_used += needed - original
+                cand.shape[combo.gi] -= combo.steps
+                combo.gpus = needed
+                combo.gi = int(math.log2(needed))
+                cand.shape[combo.gi] += combo.steps
+
+    # ---- stage 6: _assign_ranks_to_combos --------------------------------
+
+    def _assign_ranks(
+        self,
+        combos: list[_TetriCombo],
+        candidates: list[_TetriCandidate],
+        free_ranks: set[int],
+    ) -> list[list[int]]:
+        """``_assign_ranks_to_combos`` (dyn_step_scheduler.py:1076).
+
+        Phase 1 reserves ranks the request already holds, phase 2 fills from the
+        free pool in ascending rank order.
+
+        DIVERGENCE: in the released code phase 1 is dead -- ``rank_assign`` is
+        re-initialised to all -1 inside ``greedy_bin_packing_exhaustive`` and the
+        loop breaks after one iteration, so no rank is ever marked as belonging
+        to a request. We implement the intent (placement preservation, which is
+        also what our other policies do) because otherwise every combo migrates
+        ranks every round and pays our simulator's reshard cost, which their
+        model does not have. Reshard here is 3 ms against ~350-5400 ms steps, so
+        the effect is negligible either way; set placement_preserving=False
+        (TETRISERVE_PLACEMENT=0) to reproduce the released behaviour.
+        """
+        ordered_free = sorted(free_ranks)
+        groups: list[list[int]] = [[] for _ in combos]
+        reserved: set[int] = set()
+        if self.placement_preserving:
+            for pos, combo in enumerate(combos):
+                held = self._request_ranks(candidates[combo.idx].request_id)
+                if not held:
+                    continue
+                need = combo.gpus
+                for rank in ordered_free:
+                    if need == 0:
+                        break
+                    if rank in held and rank not in reserved:
+                        groups[pos].append(rank)
+                        reserved.add(rank)
+                        need -= 1
+        for pos, combo in enumerate(combos):
+            need = combo.gpus - len(groups[pos])
+            for rank in ordered_free:
+                if need == 0:
+                    break
+                if rank not in reserved:
+                    groups[pos].append(rank)
+                    reserved.add(rank)
+                    need -= 1
+        return groups
+
+    def _request_ranks(self, request_id: str) -> set[int]:
+        group_id = self.request_last_group.get(request_id)
+        if group_id is None:
+            return set()
+        try:
+            return {int(rank) for rank in self.topology.get_group(group_id).ranks}
+        except (KeyError, AttributeError):
+            return set()
+
+    # ---- stage 7: _adjust_steps_for_synchronization ----------------------
+
+    def _synchronize_steps(
+        self, combos: list[_TetriCombo], candidates: list[_TetriCandidate]
+    ) -> None:
+        """``_adjust_steps_for_synchronization`` (dyn_step_scheduler.py:1135).
+
+        ``rank_time`` is all-zero (it is re-initialised per
+        ``greedy_bin_packing_exhaustive`` call, which breaks after one
+        iteration), so ``combo_previous_time`` is 0 for every combo and
+        ``min_time_required`` collapses to the SHORTEST admitted combo's
+        duration. Every other combo is then truncated to the largest step count
+        that still fits inside it -- this is precisely the mechanism that
+        removes end-of-round idle, and the piece the previous fixed-round
+        implementation had no equivalent of. ``max_step`` starts at 1 in the
+        released code, so a combo whose single step overruns the window still
+        runs one step.
+        """
+        if not combos:
+            return
+        min_time = math.inf
+        for combo in combos:
+            cand = candidates[combo.idx]
+            min_time = min(
+                min_time,
+                self._t_step(cand.meta.latent_seq_len, combo.gpus) * combo.steps,
+            )
+        for combo in combos:
+            cand = candidates[combo.idx]
+            per_step = self._t_step(cand.meta.latent_seq_len, combo.gpus)
+            max_step = 1
+            if per_step > 0:
+                for step in range(1, combo.steps + 1):
+                    if per_step * step <= min_time + 1e-9:
+                        max_step = step
+                    else:
+                        break
+            self.sync_combos += 1
+            if max_step < combo.steps:
+                self.sync_truncations += 1
+            combo.steps = max_step
+
+
 def make_tetriserve_continuous(topology, task_runtime_estimator):
     raw = os.getenv("EDF_GREEDY_SP_SIZES", "").strip()
     allowed_sp_sizes: tuple[int, ...] | None = None
@@ -525,11 +1283,41 @@ def make_tetriserve_continuous(topology, task_runtime_estimator):
 
 
 def make_tetriserve_round(topology, task_runtime_estimator):
+    """Aligned port of the released TetriServe SLO scheduler.
+
+    Env knobs (all default to the faithful setting):
+      TETRISERVE_GPU_H100=1        use the H100_HBM3 granularity branch
+      TETRISERVE_SLO_TOLERANCE=x   survival-band tolerance (released: 0.07)
+      TETRISERVE_PLACEMENT=0       reproduce the released (dead) phase-1 rank
+                                   reservation, i.e. no placement preservation
+      TETRISERVE_ADMISSION=edf     sensitivity only: EDF instead of the released
+                                   FCFS candidate order
+      TETRISERVE_CANDIDATES=all    sensitivity only: do not truncate the
+                                   candidate list to the free-GPU count
+    """
     raw = os.getenv("EDF_GREEDY_SP_SIZES", "").strip()
     allowed_sp_sizes: tuple[int, ...] | None = None
     if raw:
         allowed_sp_sizes = tuple(int(s.strip()) for s in raw.split(",") if s.strip())
     return TetriServeRoundPolicy(
+        topology=topology,
+        task_runtime_estimator=task_runtime_estimator,
+        allowed_sp_sizes=allowed_sp_sizes,
+        gpu_is_h100=os.getenv("TETRISERVE_GPU_H100", "0") == "1",
+        slo_tolerance=float(os.getenv("TETRISERVE_SLO_TOLERANCE", SLO_TOLERANCE)),
+        placement_preserving=os.getenv("TETRISERVE_PLACEMENT", "1") != "0",
+        admission_order=os.getenv("TETRISERVE_ADMISSION", "fcfs"),
+        candidate_limit=os.getenv("TETRISERVE_CANDIDATES", "free"),
+    )
+
+
+def make_tetriserve_round_fixed(topology, task_runtime_estimator):
+    """The OLD, unfaithful fixed-wall-clock-round variant. Requires --round-ms."""
+    raw = os.getenv("EDF_GREEDY_SP_SIZES", "").strip()
+    allowed_sp_sizes: tuple[int, ...] | None = None
+    if raw:
+        allowed_sp_sizes = tuple(int(s.strip()) for s in raw.split(",") if s.strip())
+    return TetriServeFixedRoundPolicy(
         topology=topology,
         task_runtime_estimator=task_runtime_estimator,
         allowed_sp_sizes=allowed_sp_sizes,

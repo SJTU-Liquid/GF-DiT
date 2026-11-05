@@ -1,0 +1,7 @@
+.git
+**/__pycache__
+**/*.pyc
+.venv
+ae/gpu/results
+ae/sim/out
+ae/figures/figs

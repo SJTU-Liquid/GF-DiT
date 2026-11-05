@@ -1,0 +1,198 @@
+From f4bbaaa793fb4ae3cfe88310ff504065afb8bff7 Mon Sep 17 00:00:00 2001
+From: Xinwei Qiang <qiangxinwei@outlook.com>
+Date: Wed, 14 Oct 2026 19:01:58 +0000
+Subject: [PATCH 1/2] feat: abort a barrier wait when its peer is declared dead
+ (prototype)
+
+The barrier spin now also polls a host-pinned dead-peer bitmask every
+GFC_ABORT_CHECK spins (default 64; 0 disables). When the host marks a rank dead
+with runtime.declare_dead() (a plain CPU store, so it works while the runtime
+stream is blocked), waits on edges to that rank record it in abort_status and
+return instead of trapping. runtime.check_abort() then raises GFCPeerFailure,
+the CUDA context stays usable, and survivors can register a new group and keep
+running. Edges between live ranks are unaffected because every rank publishes
+before it waits.
+
+Only the default barrier path is covered; the fused path keeps the watchdog.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gfc/__init__.py        |  3 ++-
+ gfc/kernels/barrier.py | 32 +++++++++++++++++++++++++++-
+ gfc/runtime.py         | 48 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 81 insertions(+), 2 deletions(-)
+
+diff --git a/gfc/__init__.py b/gfc/__init__.py
+index e85c3bf..60ad694 100644
+--- a/gfc/__init__.py
++++ b/gfc/__init__.py
+@@ -10,10 +10,11 @@ from gfc.group import (
+     compute_token,
+     stable_hash64,
+ )
+-from gfc.runtime import SymmetricCollectiveRuntime, init_distributed_for_runtime
++from gfc.runtime import GFCPeerFailure, SymmetricCollectiveRuntime, init_distributed_for_runtime
+ 
+ __all__ = [
+     "SymmetricCollectiveConfig",
++    "GFCPeerFailure",
+     "SymmetricCollectiveRuntime",
+     "GroupDescriptor",
+     "stable_hash64",
+diff --git a/gfc/kernels/barrier.py b/gfc/kernels/barrier.py
+index 60145ff..5d527b5 100644
+--- a/gfc/kernels/barrier.py
++++ b/gfc/kernels/barrier.py
+@@ -46,8 +46,11 @@ def barrier_kernel(
+     group_ranks_row_u64,                # uint64-packed addr of uint32[max_group_size] row
+     signal_ptrs_dev_u64,                # uint64-packed addr of uint64[world_size] table
+     edge_seq_ptr_u64,                   # uint64 addr of LOCAL uint64[world_size] counter
++    dead_mask_ptr_u64,                  # uint64 addr of host-pinned uint64 dead-peer bitmask (UVA)
++    abort_status_ptr_u64,               # uint64 addr of device uint64: bitmask of peers we gave up on
+     WORLD_SIZE: tl.constexpr,
+     TIMEOUT_NS: tl.constexpr,           # 0 disables the watchdog
++    ABORT_CHECK: tl.constexpr,          # poll the dead mask every N spins; 0 disables
+ ):
+     """Per-peer barrier. Launch grid is ``(group.size,)``; each program is a
+     single-lane scalar program that handles one (self, peer) edge."""
+@@ -92,13 +95,34 @@ def barrier_kernel(
+     # device wall clock and ``trap`` on expiry, converting an otherwise-
+     # unbounded hang (mismatched barrier order, dead peer, lost token) into a
+     # diagnosable CUDA error on the host's next sync.
++    #
++    # When abort checking is enabled, the spin also polls a host-pinned
++    # dead-peer bitmask that the host sets once it detects a failed rank
++    # (``SymmetricCollectiveRuntime.declare_dead``). A wait on an edge to a
++    # dead peer then gives up: it records the peer in ``abort_status`` and
++    # returns normally instead of trapping, so the CUDA context stays usable
++    # and the host turns the abandoned collective into a Python exception.
++    # Edges between live ranks are unaffected: every rank publishes before it
++    # waits, so live peers still observe each other's tokens.
+     if TIMEOUT_NS > 0:
+         deadline = read_globaltimer() + TIMEOUT_NS
++    if ABORT_CHECK > 0:
++        dead_mask_ptr = dead_mask_ptr_u64.to(tl.pointer_type(tl.uint64))
++        abort_status_ptr = abort_status_ptr_u64.to(tl.pointer_type(tl.uint64))
++        peer_bit = tl.full((), 1, tl.uint64) << peer.to(tl.uint64)
++        spins = 0
++    aborted = 0
+     observed = ld_acquire_sys_u64(read_ptr)
+-    while observed != token:
++    while (observed != token) & (aborted == 0):
+         observed = ld_acquire_sys_u64(read_ptr)
+         if TIMEOUT_NS > 0:
+             trap_if(read_globaltimer() > deadline)
++        if ABORT_CHECK > 0:
++            spins += 1
++            if spins % ABORT_CHECK == 0:
++                if (ld_acquire_sys_u64(dead_mask_ptr) & peer_bit) != 0:
++                    tl.atomic_or(abort_status_ptr, peer_bit)
++                    aborted = 1
+ 
+ 
+ # -----------------------------------------------------------------------------
+@@ -116,6 +140,9 @@ def launch_barrier(
+     group_size: int,
+     world_size: int,
+     timeout_ns: int = 0,
++    dead_mask_ptr: int = 0,
++    abort_status_ptr: int = 0,
++    abort_check: int = 0,
+ ) -> None:
+     """Launch the barrier kernel on the current CUDA stream.
+ 
+@@ -131,8 +158,11 @@ def launch_barrier(
+         int(group_ranks_row_ptr),
+         int(signal_ptrs_dev),
+         int(edge_seq_ptr),
++        int(dead_mask_ptr),
++        int(abort_status_ptr),
+         WORLD_SIZE=int(world_size),
+         TIMEOUT_NS=int(timeout_ns),
++        ABORT_CHECK=int(abort_check),
+         num_warps=1,
+         num_stages=1,
+     )
+diff --git a/gfc/runtime.py b/gfc/runtime.py
+index 0ca5ce9..5d608e1 100644
+--- a/gfc/runtime.py
++++ b/gfc/runtime.py
+@@ -48,6 +48,14 @@ from gfc.logging import get_logger, log_footprint
+ _NONCE_STORE_KEY = "gfc/session_nonce"
+ 
+ 
++class GFCPeerFailure(RuntimeError):
++    """A collective was abandoned because a peer was declared dead."""
++
++    def __init__(self, dead_ranks: Sequence[int]) -> None:
++        self.dead_ranks = list(dead_ranks)
++        super().__init__(f"GFC collective abandoned: dead peer(s) {self.dead_ranks}")
++
++
+ class SymmetricCollectiveRuntime:
+     """Single-stream runtime over a one-time world-group symmetric rendezvous.
+ 
+@@ -173,6 +181,16 @@ class SymmetricCollectiveRuntime:
+             self.world_size, dtype=torch.uint64, device=self.device
+         )
+ 
++        # Peer-failure abort path. ``dead_mask`` is a host-pinned bitmask the
++        # barrier spin polls through UVA every ``abort_check`` iterations; the
++        # host sets a bit with a plain CPU store (no stream needed, so it works
++        # while ``self.stream`` is blocked in a spin). A wait on an edge to a
++        # dead peer records the peer in ``abort_status`` and returns without
++        # trapping. ``GFC_ABORT_CHECK=0`` disables the polling.
++        self.abort_check = int(os.environ.get("GFC_ABORT_CHECK", "64"))
++        self.dead_mask = torch.zeros(1, dtype=torch.int64, pin_memory=True)
++        self.abort_status = torch.zeros(1, dtype=torch.int64, device=self.device)
++
+         # Session nonce: rank 0 generates, broadcast via TCPStore-backed
+         # bootstrap PG using object collectives.
+         self.session_nonce = self._broadcast_session_nonce()
+@@ -247,6 +265,33 @@ class SymmetricCollectiveRuntime:
+         return n
+ 
+     # ------------------------------------------------- group registration
++    # ------------------------------------------------------------ peer failure
++    def declare_dead(self, rank: int) -> None:
++        """Mark ``rank`` as failed. Spinning waits on edges to it give up.
++
++        A plain store into host-pinned memory, safe to call from any host
++        thread (e.g. the one that noticed the peer process exit) while
++        ``self.stream`` is blocked inside a barrier.
++        """
++        _require(0 <= rank < self.world_size, f"rank {rank} out of range")
++        self.dead_mask[0] = int(self.dead_mask[0]) | (1 << int(rank))
++
++    def check_abort(self) -> None:
++        """Raise :class:`GFCPeerFailure` if a collective gave up on a dead peer.
++
++        Call after ``self.stream`` has drained. Outputs of the abandoned
++        collective are undefined; the runtime itself stays usable.
++        """
++        status = int(self.abort_status.item())
++        if status:
++            raise GFCPeerFailure(
++                [r for r in range(self.world_size) if (status >> r) & 1]
++            )
++
++    def clear_abort(self) -> None:
++        """Reset the abort status (dead peers stay marked dead)."""
++        self.abort_status.zero_()
++
+     def register_group(
+         self,
+         ranks: Sequence[int],
+@@ -424,6 +469,9 @@ class SymmetricCollectiveRuntime:
+             group_size=group.size,
+             world_size=self.world_size,
+             timeout_ns=self._timeout_ns,
++            dead_mask_ptr=self.dead_mask.data_ptr() if self.abort_check else 0,
++            abort_status_ptr=self.abort_status.data_ptr() if self.abort_check else 0,
++            abort_check=self.abort_check,
+         )
+ 
+     # --------------------------------------------------------- stream handoff
+-- 
+2.43.0
+

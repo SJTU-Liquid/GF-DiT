@@ -213,6 +213,17 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
     )
     parser.add_argument("--exec-start-delay-ms", type=float, default=0.005)
+    parser.add_argument(
+        "--round-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed round length (ms) for wall-clock round policies "
+            "(e.g. ...:make_tetriserve_round_fixed). 0 disables round ticks; "
+            "policies that derive their own round length (TetriServeRoundPolicy) "
+            "do not need it."
+        ),
+    )
     parser.add_argument("--allowed-groups", default=None, help="comma-separated group_ids; restrict topology")
     parser.add_argument(
         "--world-size",
@@ -405,6 +416,7 @@ def _run_one_policy(
         ),
         launch_end_before_exec_end_ms=args.launch_end_before_exec_end_ms,
         exec_start_delay_ms=args.exec_start_delay_ms,
+        round_ms=getattr(args, "round_ms", 0.0),
     )
     result = simulator.run(requests)
     breakdown = _request_finish_breakdown(result, requests)

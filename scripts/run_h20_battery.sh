@@ -19,7 +19,7 @@
 # the per-policy serve/bench/kill lifecycle; this script just loops profiles.
 #
 # Env knobs (h20 defaults shown):
-#   VENV_BIN=/home/LOCAL/shixuan/xinwei/.venv/bin   # h20 shared venv
+#   VENV_BIN=/path/to/shared/.venv/bin   # shared venv (default: in-repo .venv)
 #   GPUS=3,4,5,6        # CUDA_VISIBLE_DEVICES (h20: GPU3 is MIG, these map to physical 4-7)
 #   NUM_GPUS=4
 #   SP_SIZES=1,2,4
@@ -48,7 +48,7 @@ if [ "${KEEP_LD_LIBRARY_PATH:-0}" != "1" ]; then
   export LD_LIBRARY_PATH=""
 fi
 
-VENV_BIN="${VENV_BIN:-/home/LOCAL/shixuan/xinwei/.venv/bin}"
+VENV_BIN="${VENV_BIN:-.venv/bin}"
 GPUS="${GPUS:-3,4,5,6}"
 NUM_GPUS="${NUM_GPUS:-4}"
 SP_SIZES="${SP_SIZES:-1,2,4}"

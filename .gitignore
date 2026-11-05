@@ -247,3 +247,11 @@ vllm_omni/_version.py
 *.summary.txt
 wave_profiles/
 timeline*.png
+
+# Claude
+CLAUDE.md
+.claude/
+
+# Codex
+AGENTS.md
+.codex/

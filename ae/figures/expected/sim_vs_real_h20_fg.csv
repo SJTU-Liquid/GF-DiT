@@ -1,0 +1,6 @@
+policy,sim_slo_pct,real_slo_pct,absolute_error_pp
+edf_best_fit,89.23,87.69,1.5400000000000063
+srtf_sp1,81.54,76.92,4.6200000000000045
+srtf_sp4,55.38,58.46,3.0799999999999983
+fcfs_sp1,49.23,49.23,0.0
+fcfs_sp4,21.54,21.54,0.0

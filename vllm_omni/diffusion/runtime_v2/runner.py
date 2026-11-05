@@ -26,6 +26,7 @@ from vllm_omni.diffusion.runtime_v2.scheduler import (
     FCFSSchedulerPolicy,
     GlobalScheduler,
     InMemoryArtifactStore,
+    SJFSchedulerPolicy,
     SRTFSchedulerPolicy,
     TaskRuntimeEstimator,
     WaveStressSchedulerPolicy,
@@ -257,6 +258,11 @@ class RuntimeV2Runner:
                 topology=topology,
                 task_runtime_estimator=task_runtime_estimator,
             )
+        if policy_name == "sjf":
+            return SJFSchedulerPolicy(
+                topology=topology,
+                task_runtime_estimator=task_runtime_estimator,
+            )
         if policy_name == "disaggregate":
             if task_runtime_estimator is not None:
                 logger.warning(
@@ -329,7 +335,7 @@ class RuntimeV2Runner:
             )
         raise ValueError(
             "runtime_v2 scheduler_policy must be one of "
-            f"('fcfs', 'srtf', 'disaggregate', 'dynamic_step_fcfs', 'edf_greedy', 'edf_best_fit', 'wave_stress'), "
+            f"('fcfs', 'srtf', 'sjf', 'disaggregate', 'dynamic_step_fcfs', 'edf_greedy', 'edf_best_fit', 'wave_stress'), "
             f"got {scheduler_policy!r}"
         )
 

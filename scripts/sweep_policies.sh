@@ -59,7 +59,7 @@ BENCH_TIMEOUT="${BENCH_TIMEOUT:-3600}"
 COST_MODEL_DIR="${COST_MODEL_DIR:-cost-model/wan22-ti2v-5b-fullrange}"
 STATIC_SP_GROUP_FOR_FCFS_SRTF="${STATIC_SP_GROUP_FOR_FCFS_SRTF:-1}"
 # venv layout differs between machines; default to in-repo .venv, override for
-# shared venv outside the repo (e.g. VENV_BIN=/home/.../xinwei/.venv/bin).
+# shared venv outside the repo (e.g. VENV_BIN=/path/to/shared/.venv/bin).
 VENV_BIN="${VENV_BIN:-.venv/bin}"
 
 # GFC autotune (opt-in via GFC_AUTOTUNE=1). Picks a tuned collective table by
@@ -70,7 +70,7 @@ VENV_BIN="${VENV_BIN:-.venv/bin}"
 # run -- elastic{4,8} cover sub-groups (gs2/4[/8]) for elastic EDF, 2r covers
 # the world=2 single group. Default OFF so prior runs stay comparable.
 if [ "${GFC_AUTOTUNE:-0}" = "1" ]; then
-  AUTOTUNE_DIR="${AUTOTUNE_DIR:-/home/LOCAL/shixuan/xinwei/GroupFree-Collective/benchmarks}"
+  AUTOTUNE_DIR="${AUTOTUNE_DIR:-GroupFree-Collective/benchmarks}"
   case "$NUM_GPUS" in
     8) _autotune_file="$AUTOTUNE_DIR/autotune_h20_elastic8.json";;
     4) _autotune_file="$AUTOTUNE_DIR/autotune_h20_elastic4.json";;
@@ -165,7 +165,7 @@ for P in $POLICIES; do
   base_policy="$P"
   extra_args=()
   case "$P" in
-    fcfs_sp1|srtf_sp1)
+    fcfs_sp1|srtf_sp1|sjf_sp1)
       base_policy="${P%_sp1}"
       extra_args+=(--runtime-v2-groups-json "$(sp1_groups_json)" --runtime-v2-cost-model-dir "$COST_MODEL_DIR")
       ;;

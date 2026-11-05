@@ -107,5 +107,5 @@ print(f"\n{'policy':<18}{'SAR':>7}{'idle%':>8}{'makespan':>10}")
 sar, idle, mk = run("benchmarks.diffusion.policies:make_tetriserve_continuous", 0.0)
 print(f"{'A continuous':<18}{sar:>6.1f}%{idle:>7.1f}%{mk:>9.0f}s")
 for rms in (3000, 6000, 10000, 15000, 24000, 40000):
-    sar, idle, mk = run("benchmarks.diffusion.policies:make_tetriserve_round", float(rms))
+    sar, idle, mk = run("benchmarks.diffusion.policies:make_tetriserve_round_fixed", float(rms))
     print(f"{'B round '+str(rms//1000)+'s':<18}{sar:>6.1f}%{idle:>7.1f}%{mk:>9.0f}s")

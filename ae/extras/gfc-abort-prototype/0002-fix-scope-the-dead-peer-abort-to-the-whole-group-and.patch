@@ -1,0 +1,132 @@
+From b9a9ef474279c849b05f7f9cbc335ef8fc6d8793 Mon Sep 17 00:00:00 2001
+From: Xinwei Qiang <qiangxinwei@outlook.com>
+Date: Wed, 14 Oct 2026 19:15:59 +0000
+Subject: [PATCH 2/2] fix: scope the dead-peer abort to the whole group and add
+ reset_edges
+
+With edge-scoped aborts, a survivor that was one collective ahead could wait on
+a live peer that had already abandoned the previous collective, and hang until
+the watchdog. That happened in 1 of 3 random SIGKILL trials. Abort every wait of
+a collective whose group contains a dead rank (the host passes the group's rank
+bitmask). An abandoned collective can leave two survivors one barrier apart on
+their shared edge, so add reset_edges(live_peers): once all survivors have
+drained, each zeroes its sequence counter and incoming signal cells for the
+live peers before regrouping.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ gfc/kernels/barrier.py | 26 +++++++++++++++++---------
+ gfc/runtime.py         | 20 ++++++++++++++++++++
+ 2 files changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/gfc/kernels/barrier.py b/gfc/kernels/barrier.py
+index 5d527b5..bfff9eb 100644
+--- a/gfc/kernels/barrier.py
++++ b/gfc/kernels/barrier.py
+@@ -47,7 +47,8 @@ def barrier_kernel(
+     signal_ptrs_dev_u64,                # uint64-packed addr of uint64[world_size] table
+     edge_seq_ptr_u64,                   # uint64 addr of LOCAL uint64[world_size] counter
+     dead_mask_ptr_u64,                  # uint64 addr of host-pinned uint64 dead-peer bitmask (UVA)
+-    abort_status_ptr_u64,               # uint64 addr of device uint64: bitmask of peers we gave up on
++    abort_status_ptr_u64,               # uint64 addr of device uint64: dead ranks that aborted this barrier
++    group_mask,                         # bitmask of the group's global ranks
+     WORLD_SIZE: tl.constexpr,
+     TIMEOUT_NS: tl.constexpr,           # 0 disables the watchdog
+     ABORT_CHECK: tl.constexpr,          # poll the dead mask every N spins; 0 disables
+@@ -99,17 +100,21 @@ def barrier_kernel(
+     # When abort checking is enabled, the spin also polls a host-pinned
+     # dead-peer bitmask that the host sets once it detects a failed rank
+     # (``SymmetricCollectiveRuntime.declare_dead``). A wait on an edge to a
+-    # dead peer then gives up: it records the peer in ``abort_status`` and
+-    # returns normally instead of trapping, so the CUDA context stays usable
+-    # and the host turns the abandoned collective into a Python exception.
+-    # Edges between live ranks are unaffected: every rank publishes before it
+-    # waits, so live peers still observe each other's tokens.
++    # dead rank then gives up. The check is group-scoped, not edge-scoped:
++    # once any member of the group is dead, every wait of the collective
++    # gives up, including waits on live peers. A live peer may already have
++    # abandoned this collective (or never issued it), so waiting for it could
++    # hang until the watchdog. The wait records the dead ranks in
++    # ``abort_status`` and returns normally instead of trapping, so the CUDA
++    # context stays usable and the host turns the abandoned collective into a
++    # Python exception. Edge state between survivors can then disagree by one
++    # barrier, so survivors must call ``reset_edges`` before regrouping.
+     if TIMEOUT_NS > 0:
+         deadline = read_globaltimer() + TIMEOUT_NS
+     if ABORT_CHECK > 0:
+         dead_mask_ptr = dead_mask_ptr_u64.to(tl.pointer_type(tl.uint64))
+         abort_status_ptr = abort_status_ptr_u64.to(tl.pointer_type(tl.uint64))
+-        peer_bit = tl.full((), 1, tl.uint64) << peer.to(tl.uint64)
++        gmask = group_mask.to(tl.uint64)
+         spins = 0
+     aborted = 0
+     observed = ld_acquire_sys_u64(read_ptr)
+@@ -120,8 +125,9 @@ def barrier_kernel(
+         if ABORT_CHECK > 0:
+             spins += 1
+             if spins % ABORT_CHECK == 0:
+-                if (ld_acquire_sys_u64(dead_mask_ptr) & peer_bit) != 0:
+-                    tl.atomic_or(abort_status_ptr, peer_bit)
++                dead_in_group = ld_acquire_sys_u64(dead_mask_ptr) & gmask
++                if dead_in_group != 0:
++                    tl.atomic_or(abort_status_ptr, dead_in_group)
+                     aborted = 1
+ 
+ 
+@@ -143,6 +149,7 @@ def launch_barrier(
+     dead_mask_ptr: int = 0,
+     abort_status_ptr: int = 0,
+     abort_check: int = 0,
++    group_mask: int = 0,
+ ) -> None:
+     """Launch the barrier kernel on the current CUDA stream.
+ 
+@@ -160,6 +167,7 @@ def launch_barrier(
+         int(edge_seq_ptr),
+         int(dead_mask_ptr),
+         int(abort_status_ptr),
++        int(group_mask),
+         WORLD_SIZE=int(world_size),
+         TIMEOUT_NS=int(timeout_ns),
+         ABORT_CHECK=int(abort_check),
+diff --git a/gfc/runtime.py b/gfc/runtime.py
+index 5d608e1..9b2f81f 100644
+--- a/gfc/runtime.py
++++ b/gfc/runtime.py
+@@ -292,6 +292,25 @@ class SymmetricCollectiveRuntime:
+         """Reset the abort status (dead peers stay marked dead)."""
+         self.abort_status.zero_()
+ 
++    def reset_edges(self, live_peers: Sequence[int]) -> None:
++        """Re-align per-edge state with ``live_peers`` after an abort.
++
++        An abandoned collective can leave two survivors one barrier apart on
++        their shared edge (one published the next token, the other never
++        issued it). Zero this rank's sequence counter and incoming signal
++        cells for every live peer. Every survivor must call this after all
++        survivors have drained their streams, and none may start a new
++        collective until all have finished (the control plane sequences this).
++        """
++        slots = self.regions.signal_buf.tensor.numel() // self.world_size
++        with torch.cuda.stream(self.stream):
++            for p in live_peers:
++                p = int(p)
++                self.edge_seq[p] = 0
++                for s in range(slots):
++                    self.regions.signal_buf.tensor[s * self.world_size + p] = 0
++        self.stream.synchronize()
++
+     def register_group(
+         self,
+         ranks: Sequence[int],
+@@ -472,6 +491,7 @@ class SymmetricCollectiveRuntime:
+             dead_mask_ptr=self.dead_mask.data_ptr() if self.abort_check else 0,
+             abort_status_ptr=self.abort_status.data_ptr() if self.abort_check else 0,
+             abort_check=self.abort_check,
++            group_mask=sum(1 << int(r) for r in group.ranks),
+         )
+ 
+     # --------------------------------------------------------- stream handoff
+-- 
+2.43.0
+

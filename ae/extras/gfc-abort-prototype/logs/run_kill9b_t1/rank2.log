@@ -1,0 +1,3 @@
+gfc[1037644] INFO TMA disabled (use_tma=False)
+gfc[1037644] INFO rank=2 world=3 device=cuda:2 symm_mem enabled (group=0)
+RESULT {"rank": 2, "mode": "abort", "abort_check": 64, "phase": "healthy", "group": [0, 1, 2], "correct": true, "barrier_median_us": 2108.8, "all_gather_2MiB_median_us": 2444.0}
