@@ -1,16 +1,25 @@
-# Plectra GPU image: vLLM 0.17.0 + this repo (vLLM-Omni fork) + Group-Free Collectives.
-# Matches the paper's software stack: PyTorch 2.10.0+cu129, CUDA 12.9, NCCL 2.27.5, Python 3.12.
+# Plectra GPU image: vLLM 0.17.0 + this repo (vLLM-Omni fork) + Group-Free Collectives,
+# plus upstream vLLM-Omni cf328eb8 for the Legacy baseline.
+# Software stack of the paper's H20 runs: PyTorch 2.10.0+cu129, CUDA 12.9, NCCL 2.27.5,
+# Triton 3.6.0, Python 3.12. (The A100 runs used PyTorch 2.10.0 built for CUDA 13.0.)
+# Every Python package version is pinned by ae/docker/requirements-gpu.txt (compiled
+# from requirements-gpu.in, constrained to the environment our serving runs used).
 #
 #   docker build -f ae/docker/Dockerfile.gpu -t plectra-ae:gpu .        # from the repository root
+#   mkdir -p ae/gpu/results
 #   docker run --gpus all --ipc=host --shm-size 16g -it \
-#       -v $HOME/.cache/huggingface:/root/.cache/huggingface plectra-ae:gpu
+#       -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+#       -v "$PWD/ae/gpu/results:/workspace/plectra/ae/gpu/results" plectra-ae:gpu
+#
+# The container runs as root, so its results are root-owned on the host; to take them back:
+#   docker run --rm -v "$PWD/ae/gpu/results:/r" plectra-ae:gpu chown -R "$(id -u):$(id -g)" /r
 #
 # The base image only supplies the CUDA 12.9 toolkit and system libraries; all Python
 # packages live in a separate venv at /opt/venv (the base image's own PyTorch is unused).
 FROM nvcr.io/nvidia/pytorch:25.06-py3
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep the base image's NVIDIA PyTorch (and its pip constraints) out of the venv.
@@ -18,16 +27,28 @@ ENV PYTHONPATH= PIP_CONSTRAINT=
 RUN pip install --no-cache-dir uv && uv venv /opt/venv --python /usr/bin/python3
 ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH UV_LINK_MODE=copy
 
-# diffusers/transformers pinned to the versions in our development environment.
-RUN uv pip install --no-cache --torch-backend=cu129 vllm==0.17.0 diffusers==0.37.1 transformers==4.57.6
+COPY ae/docker/requirements-gpu.txt /tmp/requirements-gpu.txt
+RUN uv pip install --no-cache --torch-backend=cu129 -r /tmp/requirements-gpu.txt
+
+# The paper's Legacy baseline is upstream vLLM-Omni at cf328eb8 (the parent of the
+# runtime_v2 work), served from the same venv through PYTHONPATH; ae/gpu/common.sh
+# (run_legacy) uses LEGACY_PYTHONPATH.
+ARG LEGACY_COMMIT=cf328eb8e8ebd913d889a9f1142ee2cb801e77d2
+RUN git clone -q --filter=blob:none --no-checkout https://github.com/vllm-project/vllm-omni.git /opt/vllm-omni-legacy \
+    && git -C /opt/vllm-omni-legacy checkout -q "$LEGACY_COMMIT" \
+    && echo "$LEGACY_COMMIT" > /opt/vllm-omni-legacy/COMMIT && rm -rf /opt/vllm-omni-legacy/.git
+ENV LEGACY_PYTHONPATH=/opt/vllm-omni-legacy
 
 WORKDIR /workspace/plectra
 COPY . .
 ENV VLLM_OMNI_TARGET_DEVICE=cuda VLLM_OMNI_VERSION_OVERRIDE=0.17.0
-RUN uv pip install --no-cache --torch-backend=cu129 -e . -e ./GroupFree-Collective \
+# --no-deps: all dependencies are already installed from the lock; `uv pip check`
+# fails the build if the lock misses or mismatches anything either package needs.
+RUN uv pip install --no-cache --no-deps -e . -e ./GroupFree-Collective \
+    && uv pip check \
     && python -c "import importlib.util as u, torch; print('torch', torch.__version__); \
 assert torch.__version__.startswith('2.10.0') and torch.version.cuda == '12.9'; \
-assert all(u.find_spec(m) for m in ('vllm', 'vllm_omni', 'gfc'))"
+assert all(u.find_spec(m) for m in ('vllm', 'vllm_omni', 'gfc', 'pytest'))"
 
 # ae/gpu/common.sh picks up /opt/venv/bin through PATH.
 ENV VENV_BIN=/opt/venv/bin

@@ -52,7 +52,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def _mask_to_ranks(mask: int, world: int) -> tuple[int, ...]:
@@ -123,6 +123,7 @@ def main() -> int:
     for mask in unique_masks:
         ranks = _mask_to_ranks(mask, world)
         mask_to_group[mask] = runtime.register_group(ranks)
+    order_after_caller(runtime)  # the rank row is written on the caller's stream
 
     # Count this rank's member calls for nicer logging.
     self_bit = 1 << runtime.rank

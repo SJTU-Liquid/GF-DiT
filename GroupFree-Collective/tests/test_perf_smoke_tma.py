@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from gfc import SymmetricCollectiveConfig, SymmetricCollectiveRuntime  # noqa: E402
 
-from tests._harness import rank0_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank0_print, setup_nccl, teardown  # noqa: E402
 
 
 def _time_gpu(fn: Callable[[], None], n_iter: int, n_warmup: int, stream) -> float:
@@ -59,6 +59,7 @@ def main() -> int:
             inp = torch.empty(nbytes, dtype=torch.uint8, device=device)
             inp.fill_(runtime.rank)
             out = torch.empty(world * nbytes, dtype=torch.uint8, device=device)
+            order_after_caller(runtime)  # inputs were filled on the caller's stream
             with torch.cuda.stream(runtime.stream):
                 ag = _time_gpu(lambda: runtime.all_gather(inp, out, g), n_iter, n_warmup, runtime.stream)
             results[("all_gather", nbytes)] = ag
@@ -70,6 +71,7 @@ def main() -> int:
             inp = torch.empty(total, dtype=torch.uint8, device=device)
             inp.fill_(runtime.rank)
             out = torch.empty(total, dtype=torch.uint8, device=device)
+            order_after_caller(runtime)  # inputs were filled on the caller's stream
             with torch.cuda.stream(runtime.stream):
                 a2a = _time_gpu(lambda: runtime.all2all(inp, out, g), n_iter, n_warmup, runtime.stream)
             results[("all2all", total)] = a2a

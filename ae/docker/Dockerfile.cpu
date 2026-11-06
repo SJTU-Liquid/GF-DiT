@@ -3,7 +3,10 @@
 #   - ae/figures/run_all.sh  paper figures/tables from the raw logs (matplotlib + numpy)
 #
 #   docker build -f ae/docker/Dockerfile.cpu -t plectra-ae:cpu .        # from the repository root
-#   docker run --rm -it plectra-ae:cpu
+#   mkdir -p ae/figures/figs ae/sim/out                                 # outputs stay on the host
+#   docker run --rm -it --user "$(id -u):$(id -g)" -e HOME=/tmp \
+#       -v "$PWD/ae/figures/figs:/workspace/plectra/ae/figures/figs" \
+#       -v "$PWD/ae/sim/out:/workspace/plectra/ae/sim/out" plectra-ae:cpu
 #   # inside:  python3 ae/sim/run_claims.py --quick && bash ae/figures/run_all.sh
 FROM python:3.12-slim
 

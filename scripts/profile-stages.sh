@@ -34,11 +34,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-VISIBLE_GPUS="${CUDA_VISIBLE_DEVICES:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)}"
-if [[ "$VISIBLE_GPUS" == *","* ]]; then
-  NUM_GPUS=$(echo "$VISIBLE_GPUS" | tr ',' '\n' | wc -l)
+# CUDA_VISIBLE_DEVICES is a list of device ids ("6" is one GPU, "6,7" two); without
+# it, count the GPUs nvidia-smi reports.
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  NUM_GPUS=$(awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")
 else
-  NUM_GPUS="$VISIBLE_GPUS"
+  NUM_GPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
 fi
 echo "detected $NUM_GPUS visible GPU(s)"
 mkdir -p "$OUT_DIR"

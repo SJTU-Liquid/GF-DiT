@@ -27,7 +27,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def main() -> int:
@@ -48,6 +48,7 @@ def main() -> int:
     def do_one(g):
         inp = torch.full((n_elems,), runtime.rank, dtype=torch.int32, device=device)
         out = torch.empty(g.size * n_elems, dtype=torch.int32, device=device)
+        order_after_caller(runtime)
         runtime.all_gather(inp, out, g)
         return inp, out
 

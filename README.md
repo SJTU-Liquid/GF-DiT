@@ -15,8 +15,10 @@
 
 > This repository is the research artifact for **Plectra** (PPoPP 2027). Plectra is
 > implemented as a task-centric elastic runtime (`runtime_v2`) inside a fork of vLLM-Omni,
-> plus a group-free collective backend. It is **opt-in** — with `--enable-runtime-v2`
-> omitted the server behaves exactly like stock vLLM-Omni.
+> plus a group-free collective backend. It is **opt-in**: without `--enable-runtime-v2`
+> the server takes vLLM-Omni's fixed-pipeline serving path. That path runs through shared
+> code the fork extends, so it is not identical to upstream; the paper's Legacy baseline is
+> upstream vLLM-Omni `cf328eb8` (see [`ae/README.md`](./ae/README.md)).
 
 ## What is Plectra
 
@@ -67,23 +69,30 @@ Plectra lives under `vllm_omni/diffusion/runtime_v2/` plus the group-free collec
 | ----------------------- | ------------------------------------------------------------------------------ | ---- |
 | Task-graph scheduler    | Event-driven dispatch of trajectory tasks; per-request lifecycle               | `runtime_v2/scheduler.py`, `runtime_v2/runner.py` |
 | Elastic migration       | Layout-aware online artifact movement across execution groups (SP reshard)     | `runtime_v2/migration_engine.py`, `runtime_v2/data_plane.py` |
-| Group-free collectives  | µs-cost online group formation/reconfig (`all_gather` / `all2all` / `p2p`)      | `distributed/collective_runtime.py` + [`GroupFree-Collective/`](./GroupFree-Collective) |
+| Group-free collectives  | µs-cost online group formation/reconfig (`all_gather` / `all2all` / `p2p`)      | `diffusion/distributed/collective_runtime.py` + [`GroupFree-Collective/`](./GroupFree-Collective) |
 | Pluggable policies      | Choose task order + execution layout per objective                             | `runtime_v2/policies/` — FCFS, SRTF, SJF, EDF-greedy, EDF-best-fit, disaggregate, wave-stress |
 | Cost model + simulator  | Per-stage latency model for deadline-aware policies; offline what-if analysis  | `runtime_v2/cost_model.py`, `benchmarks/diffusion/` |
 
 ## Quickstart
 
-Plectra builds on vLLM-Omni. Install the base framework (see the upstream
-[installation guide](https://vllm-omni.readthedocs.io/en/latest/getting_started/installation/)),
-then this fork:
+Plectra builds on vLLM-Omni and vLLM 0.17.0. Install the pinned dependencies first:
+resolving against today's PyPI pulls newer releases, some of which break vLLM 0.17.0
+(e.g. a FastAPI release whose routing change makes every request fail).
 
 ```bash
-# base framework + this fork
-pip install -e .
-
-# (optional) group-free collectives — enables the elastic group-reconfig path
-pip install -e ./GroupFree-Collective
+uv venv --python 3.12 .venv && . .venv/bin/activate
+uv pip install --torch-backend=cu129 -r ae/docker/requirements-gpu.txt   # pinned versions
+# this fork (VLLM_OMNI_VERSION_OVERRIDE is needed for copies without git metadata, e.g. the
+# archived artifact) and the group-free collectives, needed by the EDF policies and the
+# elastic group-reconfig path
+VLLM_OMNI_TARGET_DEVICE=cuda VLLM_OMNI_VERSION_OVERRIDE=0.17.0 \
+  uv pip install --no-deps -e . -e ./GroupFree-Collective
 ```
+
+The lock holds the package versions of our serving environment with the CUDA 12.9 build
+of PyTorch 2.10 used for the paper's H20 runs (the A100 runs used a CUDA 13.0 build);
+`ae/docker/Dockerfile.gpu` builds the same environment as an image. See
+[`ae/README.md`](./ae/README.md).
 
 Serve a DiT model with the elastic runtime enabled:
 
@@ -93,14 +102,22 @@ vllm serve <your-dit-model> --omni \
   --enable-runtime-v2 \
   --runtime-v2-scheduler-policy edf_best_fit \
   --runtime-v2-collective-backend gfc \
-  --runtime-v2-gfc-max-collective-mb 1024
+  --runtime-v2-gfc-max-collective-mb 1024 \
+  --runtime-v2-cost-model-dir <cost-model dir> \
+  --runtime-v2-edf-greedy-sp-sizes 1,2,4
 ```
 
-Without `gfc` installed, use the dependency-free PyTorch backend — the task-graph scheduler
-still runs, but without online group reconfiguration:
+EDF best-fit needs a per-stage cost model profiled on the serving GPUs
+(`ae/gpu/05_cost_model.sh`; the paper's H20/A100 cost models are in `ae/gpu/inputs/`).
+Without one it falls back to largest-fit. `ae/gpu/04_serve_smoke.sh` is a complete example
+for Wan2.2.
+
+Without `gfc` installed, the dependency-free PyTorch backend runs the task-graph scheduler
+with the static policies only (`fcfs`, `srtf`, `sjf`, `disaggregate`, `dynamic_step_fcfs`);
+the EDF policies require GFC:
 
 ```bash
-  --runtime-v2-collective-backend torch
+  --runtime-v2-scheduler-policy fcfs --runtime-v2-collective-backend torch
 ```
 
 vLLM-Omni exposes an OpenAI-compatible API; send a generation request (see the upstream
@@ -114,8 +131,8 @@ curl http://localhost:8000/v1/images/generations \
 ```
 
 Ready-made launch scripts live in `scripts/` — e.g. `serve-adaptive.sh`, `serve-elastic.sh`,
-`serve-edf-best.sh`, `serve-disaggragate.sh`, and the static baselines
-`serve-baseline-sp4.sh` / `serve-base.sh`.
+`serve-edf-best.sh` (H20 cost model by default; set `COST_MODEL_DIR` on other GPUs),
+`serve-disaggragate.sh`, and the static baselines `serve-baseline-sp4.sh` / `serve-base.sh`.
 
 ### Key flags
 
@@ -126,6 +143,8 @@ Ready-made launch scripts live in `scripts/` — e.g. `serve-adaptive.sh`, `serv
 | `--runtime-v2-collective-backend`    | `torch` (default, no extra deps) or `gfc` (elastic group reconfig) |
 | `--runtime-v2-denoise-chunk-size`    | Denoise steps per schedulable task chunk |
 | `--runtime-v2-gfc-max-collective-mb` | GFC symmetric-memory budget per rank (MiB) |
+| `--runtime-v2-cost-model-dir`        | Per-stage latency model used by the EDF policies (without it EDF falls back to largest-fit) |
+| `--runtime-v2-edf-greedy-sp-sizes`   | SP sizes the EDF policies may choose from, e.g. `1,2,4` |
 
 ## Reproducing the paper results
 
@@ -145,9 +164,11 @@ Underlying entry points:
 
 ## Relationship to vLLM-Omni
 
-This repository is a fork of [vLLM-Omni](https://github.com/vllm-project/vllm-omni). Plectra
-is additive: it lives under `vllm_omni/diffusion/runtime_v2/` and the GFC collective
-backend, and is gated behind `--enable-runtime-v2`. Base installation, supported models, and
+This repository is a fork of [vLLM-Omni](https://github.com/vllm-project/vllm-omni). Most of
+Plectra lives under `vllm_omni/diffusion/runtime_v2/` and the GFC collective backend and is
+gated behind `--enable-runtime-v2`; it also extends shared code (distributed state, diffusion
+workers and scheduler, entrypoints and CLI), so with runtime_v2 off the server is close to,
+but not identical with, upstream. Base installation, supported models, and
 the OpenAI-compatible server all follow upstream vLLM-Omni — see their
 [documentation](https://vllm-omni.readthedocs.io/en/latest/).
 

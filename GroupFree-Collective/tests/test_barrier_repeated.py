@@ -26,7 +26,7 @@ from gfc import (  # noqa: E402
     compute_token,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def main() -> int:
@@ -39,6 +39,7 @@ def main() -> int:
     )
     runtime = SymmetricCollectiveRuntime(config, device=device)
     g = runtime.register_group((0, 1))
+    order_after_caller(runtime)  # the rank row is written on the caller's stream
 
     n_iters = 1000
     expected_tokens = [

@@ -28,7 +28,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def _pattern(epoch: int, role: str, nbytes: int, device) -> torch.Tensor:
@@ -44,9 +44,11 @@ def test_push(runtime: SymmetricCollectiveRuntime, nbytes: int, n_iter: int) -> 
     for ep in range(n_iter):
         if runtime.rank == 0:
             src = _pattern(ep, "put", nbytes, runtime.device)
+            order_after_caller(runtime)
             runtime.p2p_put(dst_rank=1, src=src)
         else:
             dst = torch.empty(nbytes, dtype=torch.uint8, device=runtime.device)
+            order_after_caller(runtime)
             runtime.p2p_put_recv(src_rank=0, dst=dst)
             runtime.stream.synchronize()
             ref = _pattern(ep, "put", nbytes, runtime.device)
@@ -66,9 +68,11 @@ def test_pull(runtime: SymmetricCollectiveRuntime, nbytes: int, n_iter: int) -> 
     for ep in range(n_iter):
         if runtime.rank == 0:
             src = _pattern(ep, "get", nbytes, runtime.device)
+            order_after_caller(runtime)
             runtime.p2p_get_serve(dst_rank=1, src=src)
         else:
             dst = torch.empty(nbytes, dtype=torch.uint8, device=runtime.device)
+            order_after_caller(runtime)
             runtime.p2p_get(src_rank=0, dst=dst)
             runtime.stream.synchronize()
             ref = _pattern(ep, "get", nbytes, runtime.device)
@@ -91,6 +95,9 @@ def main() -> int:
         max_collective_bytes=1 * 1024 * 1024,
     )
     runtime = SymmetricCollectiveRuntime(config, device=device)
+    # Register the pair up front: register_group writes the rank row on the
+    # caller's stream, so it must precede order_after_caller.
+    runtime.register_group((0, 1))
 
     for nbytes in (256, 4096, 64 * 1024):
         test_push(runtime, nbytes, n_iter=100)

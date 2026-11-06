@@ -22,7 +22,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def main() -> int:
@@ -46,6 +46,7 @@ def main() -> int:
         marker = (it + 1) & 0xFF
         inp = torch.full((n_elems,), marker, dtype=torch.uint8, device=device) ^ runtime.rank
         out = torch.empty(2 * n_elems, dtype=torch.uint8, device=device)
+        order_after_caller(runtime)
         runtime.all_gather(inp, out, g)
         runtime.stream.synchronize()
 

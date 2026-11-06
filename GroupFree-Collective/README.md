@@ -37,6 +37,10 @@ g = runtime.register_group((0, 1, 3))
 if g.local_index >= 0:
     inp = torch.full((1024,), dist.get_rank(), dtype=torch.bfloat16, device=device)
     out = torch.empty(g.size * 1024, dtype=torch.bfloat16, device=device)
+    # `inp` was written on the current stream: order runtime.stream after it
+    # (see "Stream model" below).
+    ev = torch.cuda.Event(); ev.record()
+    runtime.wait_for_external(ev)
     runtime.all_gather(inp, out, g)
     runtime.stream.synchronize()
     # out[i * 1024 : (i + 1) * 1024] now holds rank `g.ranks[i]`'s input.
@@ -83,8 +87,10 @@ is single-stream; concurrent multi-stream submission is a v2 non-goal.
 ## Testing
 
 ```bash
-# Picks up GPUs from $GFC_GPUS (default: 1,2,3,4 so GPU 0 is left alone).
-./tests/run_all.sh
+# Picks up GPUs from $GFC_GPUS (default: 1,2,3,4 so GPU 0 is left alone), and
+# python3 / torchrun from PATH (override with $GFC_PY / $GFC_TORCHRUN).
+# Tests that need more GPUs than $GFC_GPUS lists are skipped.
+GFC_GPUS=0,1,2,3 ./tests/run_all.sh
 ```
 
 Individual tests live under `tests/`. All multi-process tests are torchrun

@@ -7,8 +7,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-py="${GFC_PY:-/workspace/vllm-omni-private/.venv/bin/python}"
-torchrun="${GFC_TORCHRUN:-/workspace/vllm-omni-private/.venv/bin/torchrun}"
+# python3 / torchrun of the active environment unless GFC_PY / GFC_TORCHRUN are set.
+py="${GFC_PY:-$(command -v python3 || true)}"
+torchrun="${GFC_TORCHRUN:-$(command -v torchrun || true)}"
+[ -n "$py" ] && [ -x "$py" ] || { echo "run_all.sh: no python3 found; activate the environment with torch, triton and gfc, or set GFC_PY" >&2; exit 1; }
+[ -n "$torchrun" ] && [ -x "$torchrun" ] || { echo "run_all.sh: no torchrun found; activate the environment with torch, or set GFC_TORCHRUN" >&2; exit 1; }
 gpus="${GFC_GPUS:-1,2,3,4}"
 
 # Number of comma-separated GPUs available.
@@ -29,7 +32,7 @@ run_torchrun () {
     rm -rf /tmp/gfc_run
     CUDA_VISIBLE_DEVICES="$gpus" "$torchrun" \
         --standalone --nproc_per_node="$nproc" \
-        --redirects=3 --log-dir /tmp/gfc_run "$path"
+        --tee=3 --log-dir /tmp/gfc_run "$path"
 }
 
 # Phase 1

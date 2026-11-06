@@ -26,7 +26,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def _slice_pattern(s: int, t: int, slice_bytes: int, device) -> torch.Tensor:
@@ -44,6 +44,7 @@ def _one_case(runtime, group, slice_bytes: int) -> None:
         )
 
     out = torch.empty(group.size * slice_bytes, dtype=torch.uint8, device=runtime.device)
+    order_after_caller(runtime)
     runtime.all2all(inp, out, group)
     runtime.stream.synchronize()
 

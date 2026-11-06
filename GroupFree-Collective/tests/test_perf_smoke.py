@@ -27,7 +27,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank0_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank0_print, setup_nccl, teardown  # noqa: E402
 
 
 def _time_gpu(fn: Callable[[], None], n_iter: int, n_warmup: int, stream) -> float:
@@ -74,6 +74,7 @@ def main() -> int:
         inp.fill_(runtime.rank)
         out = torch.empty(world * nbytes, dtype=torch.uint8, device=device)
 
+        order_after_caller(runtime)  # inputs were filled on the caller's stream
         with torch.cuda.stream(runtime.stream):
             gfc_us = _time_gpu(
                 lambda: runtime.all_gather(inp, out, g),
@@ -99,6 +100,7 @@ def main() -> int:
         inp.fill_(runtime.rank)
         out = torch.empty(world * slice_bytes, dtype=torch.uint8, device=device)
 
+        order_after_caller(runtime)  # inputs were filled on the caller's stream
         with torch.cuda.stream(runtime.stream):
             gfc_us = _time_gpu(
                 lambda: runtime.all2all(inp, out, g),

@@ -18,3 +18,9 @@ dependencies = [
 [tool.setuptools.packages.find]
 include = ["gfc*"]
 exclude = ["tests*", "benchmarks*", "docs*"]
+
+[tool.pytest.ini_options]
+# GFC's own pytest config: stops pytest from picking up the settings of an
+# enclosing repository (e.g. vLLM-Omni's asyncio_mode / --strict-config) when the
+# tests run from a vendored copy.
+testpaths = ["tests"]

@@ -24,7 +24,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 _DTYPES = [torch.uint8, torch.float32, torch.bfloat16, torch.float16]
@@ -38,6 +38,7 @@ def _one_case(runtime, group, dtype: torch.dtype, n_elems: int) -> None:
         group.size * n_elems, dtype=dtype, device=runtime.device
     )
 
+    order_after_caller(runtime)
     runtime.all_gather(inp, out, group)
     runtime.stream.synchronize()
 

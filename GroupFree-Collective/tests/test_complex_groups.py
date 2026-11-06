@@ -25,7 +25,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def _install_new_group_tripwire() -> None:
@@ -110,6 +110,7 @@ def _run_all_gather(runtime: SymmetricCollectiveRuntime, group, case_idx: int) -
     inp = _ag_pattern(runtime.rank, case_idx, nbytes, runtime.device)
     out = torch.empty(group.size * nbytes, dtype=torch.uint8, device=runtime.device)
 
+    order_after_caller(runtime)
     runtime.all_gather(inp, out, group)
     runtime.stream.synchronize()
 
@@ -134,6 +135,7 @@ def _run_all2all(runtime: SymmetricCollectiveRuntime, group, case_idx: int) -> N
         )
 
     out = torch.empty_like(inp)
+    order_after_caller(runtime)
     runtime.all2all(inp, out, group)
     runtime.stream.synchronize()
 

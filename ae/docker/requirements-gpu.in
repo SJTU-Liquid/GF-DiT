@@ -1,0 +1,12 @@
+# Top-level requirements of the GPU environment (as in the paper's H20 runs: PyTorch 2.10
+# + CUDA 12.9, vLLM 0.17.0; the A100 runs used a CUDA 13.0 build of PyTorch 2.10). Compiled to requirements-gpu.txt, which Dockerfile.gpu installs:
+#   uv pip compile ae/docker/requirements-gpu.in -o ae/docker/requirements-gpu.txt \
+#     --torch-backend cu129 --python-version 3.12 --python-platform x86_64-manylinux_2_28
+-c constraints-devenv.txt  # versions of the environment our serving runs used
+vllm==0.17.0
+diffusers==0.37.1          # versions in our development environment
+transformers==4.57.6
+-r ../../requirements/cuda.txt
+torch>=2.10                # GroupFree-Collective
+triton>=3.6
+pytest                     # GFC test suite (ae/gpu/01_gfc_correctness.sh)

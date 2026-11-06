@@ -24,7 +24,7 @@ from gfc import (  # noqa: E402
     SymmetricCollectiveRuntime,
 )
 
-from tests._harness import rank_print, setup_nccl, teardown  # noqa: E402
+from tests._harness import order_after_caller, rank_print, setup_nccl, teardown  # noqa: E402
 
 
 def _install_new_group_tripwire() -> None:
@@ -58,6 +58,7 @@ def main() -> int:
         runtime.register_group((1, 3)),
         runtime.register_group((0, 1, 3)),
     ]
+    order_after_caller(runtime)  # the rank row is written on the caller's stream
 
     iters_per_group = 50
     for g in groups:

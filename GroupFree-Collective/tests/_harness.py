@@ -40,3 +40,17 @@ def rank0_print(*args, **kwargs) -> None:
 
 def rank_print(*args, **kwargs) -> None:
     print(f"[rank {os.environ.get('RANK', '?')}]", *args, **kwargs, flush=True)
+
+
+def order_after_caller(runtime) -> None:
+    """Make ``runtime.stream`` wait for the work already queued on the caller's
+    current stream, so a collective sees fully written inputs.
+
+    This GFC version leaves that ordering to the caller (``wait_for_external``);
+    Plectra does it in vllm_omni/diffusion/distributed/collective_runtime.py.
+    Without it, a test that fills its input on the default stream races the
+    collective on ``runtime.stream`` and can read stale bytes.
+    """
+    ev = torch.cuda.Event()
+    ev.record()
+    runtime.wait_for_external(ev)
